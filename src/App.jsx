@@ -4,7 +4,7 @@ import {
   Plus, X, Trash2, Pencil, ChevronDown, ChevronUp, Check,
   Thermometer, Droplets, Wind, Mountain, Calendar, MapPin,
   Flame, Settings2, Package, Layers, Zap, Wrench, TriangleAlert,
-  Trophy, ThumbsDown, Flag, Calculator, Eye, Download, Upload
+  Trophy, ThumbsDown, Flag, Calculator, Eye, Download, Upload, RefreshCw
 } from "lucide-react";
 
 const RUNS_KEY = "novalog-runs";
@@ -196,28 +196,43 @@ export default function NovaRunTracker() {
     meta.setAttribute("content", content);
   }, []);
 
+  const [syncing, setSyncing] = useState(false);
+
+  const loadData = async ({ silent } = {}) => {
+    if (!silent) setSyncing(true);
+    let loadedRuns = [];
+    let loadedComponents = null;
+    try {
+      const r = await storage.get(RUNS_KEY);
+      if (r && r.value) loadedRuns = JSON.parse(r.value);
+    } catch (e) {}
+    try {
+      const c = await storage.get(COMPONENTS_KEY);
+      if (c && c.value) loadedComponents = JSON.parse(c.value);
+    } catch (e) {}
+    if (!loadedComponents) {
+      loadedComponents = [
+        { id: "engine", name: "Engine", sinceRuns: 0, history: [], createdAt: Date.now() },
+        { id: "tires", name: "Tires", sinceRuns: 0, history: [], createdAt: Date.now() },
+      ];
+    }
+    setRuns(loadedRuns);
+    setComponents(loadedComponents);
+    setLoaded(true);
+    setSyncing(false);
+  };
+
   useEffect(() => {
-    (async () => {
-      let loadedRuns = [];
-      let loadedComponents = null;
-      try {
-        const r = await storage.get(RUNS_KEY);
-        if (r && r.value) loadedRuns = JSON.parse(r.value);
-      } catch (e) {}
-      try {
-        const c = await storage.get(COMPONENTS_KEY);
-        if (c && c.value) loadedComponents = JSON.parse(c.value);
-      } catch (e) {}
-      if (!loadedComponents) {
-        loadedComponents = [
-          { id: "engine", name: "Engine", sinceRuns: 0, history: [], createdAt: Date.now() },
-          { id: "tires", name: "Tires", sinceRuns: 0, history: [], createdAt: Date.now() },
-        ];
-      }
-      setRuns(loadedRuns);
-      setComponents(loadedComponents);
-      setLoaded(true);
-    })();
+    loadData();
+  }, []);
+
+  // Live sync: when another device writes a run or component change,
+  // pull the fresh data automatically — no restart needed.
+  useEffect(() => {
+    const unsubscribe = storage.subscribe(() => {
+      loadData({ silent: true });
+    });
+    return unsubscribe;
   }, []);
 
   const persistRuns = async (next) => {
@@ -419,15 +434,24 @@ export default function NovaRunTracker() {
               Nova Run Log
             </div>
           </div>
-          <button
-            onClick={() => setBigText(!bigText)}
-            className={`flex items-center gap-1 text-[10px] font-display uppercase tracking-wide px-2.5 py-1.5 rounded-full border ${
-              bigText ? "bg-amber-400 border-amber-400 text-zinc-950" : "bg-zinc-900 border-zinc-800 text-zinc-400"
-            }`}
-          >
-            <Eye size={13} />
-            No Glasses
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => loadData()}
+              className="flex items-center justify-center w-8 h-8 rounded-full bg-zinc-900 border border-zinc-800 text-zinc-400"
+              title="Refresh from database"
+            >
+              <RefreshCw size={13} className={syncing ? "animate-spin" : ""} />
+            </button>
+            <button
+              onClick={() => setBigText(!bigText)}
+              className={`flex items-center gap-1 text-[10px] font-display uppercase tracking-wide px-2.5 py-1.5 rounded-full border ${
+                bigText ? "bg-amber-400 border-amber-400 text-zinc-950" : "bg-zinc-900 border-zinc-800 text-zinc-400"
+              }`}
+            >
+              <Eye size={13} />
+              No Glasses
+            </button>
+          </div>
         </div>
 
         {tab === "nobox" || tab === "box" ? (

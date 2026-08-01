@@ -24,4 +24,17 @@ export const storage = {
     }
     return { key, value };
   },
+
+  // Calls onChange(key) whenever ANY device writes to kv_store, so the UI can
+  // re-fetch and stay in sync without a manual restart. Returns an unsubscribe fn.
+  subscribe(onChange) {
+    const channel = supabase
+      .channel("kv_store_changes")
+      .on("postgres_changes", { event: "*", schema: "public", table: "kv_store" }, (payload) => {
+        const key = payload.new?.key || payload.old?.key;
+        onChange(key);
+      })
+      .subscribe();
+    return () => supabase.removeChannel(channel);
+  },
 };
