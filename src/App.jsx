@@ -26,6 +26,12 @@ const nowTimeStr = () => {
 };
 const genId = () => `r-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
+const runTimestamp = (r) => {
+  const t = r.time && /^\d{2}:\d{2}$/.test(r.time) ? r.time : "00:00";
+  const ts = new Date(`${r.date}T${t}:00`).getTime();
+  return isNaN(ts) ? 0 : ts;
+};
+
 const fmt = (v, d = 3) => {
   if (v === "" || v === null || v === undefined || isNaN(v)) return "—";
   return Number(v).toFixed(d);
@@ -395,23 +401,20 @@ export default function NovaRunTracker() {
     if (tab !== "nobox" && tab !== "box" && tab !== "elliot") return { date: null, items: [] };
     const typed = runs.filter((r) => r.type === tab);
     if (typed.length === 0) return { date: null, items: [] };
-    const latestDate = typed.reduce((max, r) => (r.date > max ? r.date : max), typed[0].date);
-    const dayRuns = typed
-      .filter((r) => r.date === latestDate)
-      .sort((a, b) => {
-        const av = `${a.date}T${a.time || "00:00"}`;
-        const bv = `${b.date}T${b.time || "00:00"}`;
-        if (av !== bv) return av < bv ? -1 : 1;
-        return (a.createdAt || 0) - (b.createdAt || 0);
-      });
-    const values = dayRuns.map((r) => computeSegments(r).seg60_330).filter((v) => v != null && !isNaN(v));
+    const withTs = typed
+      .map((r) => ({ r, ts: runTimestamp(r) }))
+      .sort((a, b) => (a.ts !== b.ts ? a.ts - b.ts : (a.r.createdAt || 0) - (b.r.createdAt || 0)));
+    const latestTs = withTs[withTs.length - 1].ts;
+    const windowStart = latestTs - 24 * 60 * 60 * 1000;
+    const recent = withTs.filter((x) => x.ts >= windowStart).slice(-10);
+    const values = recent.map((x) => computeSegments(x.r).seg60_330).filter((v) => v != null && !isNaN(v));
     const min = values.length ? Math.min(...values) : 0;
     const max = values.length ? Math.max(...values) : 0;
-    const items = dayRuns.map((r) => {
-      const seg = computeSegments(r).seg60_330;
-      return { id: r.id, seg, color: segColor(seg, min, max) };
+    const items = recent.map((x) => {
+      const seg = computeSegments(x.r).seg60_330;
+      return { id: x.r.id, seg, color: segColor(seg, min, max) };
     });
-    return { date: latestDate, items };
+    return { date: recent[recent.length - 1].r.date, items };
   }, [runs, tab]);
 
   if (!loaded) {
