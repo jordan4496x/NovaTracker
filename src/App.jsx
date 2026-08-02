@@ -4,8 +4,17 @@ import {
   Plus, X, Trash2, Pencil, ChevronDown, ChevronUp, Check,
   Thermometer, Droplets, Wind, Mountain, Calendar, MapPin,
   Flame, Settings2, Package, Layers, Zap, Wrench, TriangleAlert,
-  Trophy, ThumbsDown, Flag, Calculator, Eye, Download, Upload, RefreshCw
+  Trophy, ThumbsDown, Flag, Calculator, Eye, Download, Upload, RefreshCw, User
 } from "lucide-react";
+
+const TYPE_LABELS = { nobox: "No Box", box: "Box", elliot: "Elliot" };
+const typeLabel = (type) => TYPE_LABELS[type] || type;
+const TYPE_BADGE_CLASSES = {
+  nobox: "bg-amber-950 text-amber-400",
+  box: "bg-sky-950 text-sky-400",
+  elliot: "bg-violet-950 text-violet-400",
+};
+const typeBadgeClass = (type) => TYPE_BADGE_CLASSES[type] || TYPE_BADGE_CLASSES.nobox;
 
 const RUNS_KEY = "novalog-runs";
 const COMPONENTS_KEY = "novalog-components";
@@ -52,6 +61,7 @@ const emptyForm = (type, lastTrack = "") => ({
   mph: "",
   dialIn: "",
   delay: "",
+  lane: "L",
   lifted: false,
   result: null, // 'trial' | 'win' | 'lose' | null
   temp: "",
@@ -146,7 +156,7 @@ export default function NovaRunTracker() {
       const { seg60_330, seg330_8th } = computeSegments(r);
       const pkg = computePackage(r);
       return [
-        r.date, r.time || "", r.type === "box" ? "Box" : "No Box", r.track,
+        r.date, r.time || "", typeLabel(r.type), r.track,
         r.rt, r.sixty, r.threeThirty, r.eighth, r.mph, r.dialIn, r.delay,
         seg60_330 == null ? "" : seg60_330.toFixed(3),
         seg330_8th == null ? "" : seg330_8th.toFixed(3),
@@ -326,6 +336,7 @@ export default function NovaRunTracker() {
     let list = runs;
     if (tab === "nobox") list = runs.filter((r) => r.type === "nobox");
     if (tab === "box") list = runs.filter((r) => r.type === "box");
+    if (tab === "elliot") list = runs.filter((r) => r.type === "elliot");
     return [...list].sort((a, b) => {
       const av = `${a.date}T${a.time || "00:00"}`;
       const bv = `${b.date}T${b.time || "00:00"}`;
@@ -381,7 +392,7 @@ export default function NovaRunTracker() {
   }, [runs]);
 
   const daySegments = useMemo(() => {
-    if (tab !== "nobox" && tab !== "box") return { date: null, items: [] };
+    if (tab !== "nobox" && tab !== "box" && tab !== "elliot") return { date: null, items: [] };
     const typed = runs.filter((r) => r.type === tab);
     if (typed.length === 0) return { date: null, items: [] };
     const latestDate = typed.reduce((max, r) => (r.date > max ? r.date : max), typed[0].date);
@@ -454,11 +465,11 @@ export default function NovaRunTracker() {
           </div>
         </div>
 
-        {tab === "nobox" || tab === "box" ? (
+        {tab === "nobox" || tab === "box" || tab === "elliot" ? (
           <div>
             <div className="flex items-center justify-between mb-1.5">
               <div className="text-[10px] uppercase tracking-wide text-zinc-500">
-                60-330 Segment · {tab === "box" ? "Box" : "No Box"} {daySegments.date ? `· ${fmtDate(daySegments.date)}` : ""}
+                60-330 Segment · {typeLabel(tab)} {daySegments.date ? `· ${fmtDate(daySegments.date)}` : ""}
               </div>
             </div>
             {daySegments.items.length === 0 ? (
@@ -626,6 +637,7 @@ export default function NovaRunTracker() {
         {[
           ["nobox", "No Box", Zap],
           ["box", "Box", Package],
+          ["elliot", "Elliot", User],
           ["predict", "Predict", Calculator],
           ["all", "All", Layers],
           ["setup", "Service Items", Settings2],
@@ -686,11 +698,11 @@ function RunCard({ run, expanded, onToggle, onEdit, onDelete, showTypeBadge }) {
             <span className="truncate">{run.track || "—"}</span>
             {showTypeBadge && (
               <span
-                className={`shrink-0 text-[9px] uppercase font-display tracking-wide px-1.5 py-0.5 rounded-full ${
-                  run.type === "box" ? "bg-sky-950 text-sky-400" : "bg-amber-950 text-amber-400"
-                }`}
+                className={`shrink-0 text-[9px] uppercase font-display tracking-wide px-1.5 py-0.5 rounded-full ${typeBadgeClass(
+                  run.type
+                )}`}
               >
-                {run.type === "box" ? "Box" : "No Box"}
+                {typeLabel(run.type)}
               </span>
             )}
           </div>
@@ -864,7 +876,7 @@ function RunSheet({ form, setForm, onSave, onClose, bigText, setBigText }) {
         </div>
 
         <div className="flex gap-2 mb-4">
-          {["nobox", "box"].map((t) => (
+          {["nobox", "box", "elliot"].map((t) => (
             <button
               key={t}
               onClick={() => setForm({ ...form, type: t })}
@@ -872,7 +884,7 @@ function RunSheet({ form, setForm, onSave, onClose, bigText, setBigText }) {
                 form.type === t ? "bg-amber-400 text-zinc-950 border-amber-400" : "bg-zinc-900 text-zinc-400 border-zinc-800"
               }`}
             >
-              {t === "box" ? "Box" : "No Box"}
+              {typeLabel(t)}
             </button>
           ))}
         </div>
@@ -883,6 +895,31 @@ function RunSheet({ form, setForm, onSave, onClose, bigText, setBigText }) {
         </div>
         <div className="mb-3">
           <Field label="Track" value={form.track} onChange={set("track")} placeholder="e.g. Fairfield Glade" />
+        </div>
+
+        <div className="mb-3">
+          <div className="text-[10px] uppercase tracking-wide text-zinc-500 mb-1.5">Lane</div>
+          <div className="flex gap-2">
+            {["R", "L"].map((laneKey) => (
+              <button
+                key={laneKey}
+                type="button"
+                onClick={() => setForm({ ...form, lane: laneKey })}
+                className={`flex-1 flex items-center justify-center gap-2 px-3 py-2 rounded-lg border text-xs font-medium ${
+                  form.lane === laneKey ? "bg-amber-950 border-amber-700 text-amber-400" : "bg-zinc-900 border-zinc-800 text-zinc-400"
+                }`}
+              >
+                <span
+                  className={`w-4 h-4 rounded flex items-center justify-center border ${
+                    form.lane === laneKey ? "bg-amber-500 border-amber-500" : "border-zinc-600"
+                  }`}
+                >
+                  {form.lane === laneKey && <Check size={12} className="text-zinc-950" />}
+                </span>
+                {laneKey}
+              </button>
+            ))}
+          </div>
         </div>
 
         <div className="grid grid-cols-3 gap-3 mb-3">
