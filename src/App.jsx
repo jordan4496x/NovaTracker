@@ -4,7 +4,7 @@ import {
   Plus, X, Trash2, Pencil, ChevronDown, ChevronUp, Check,
   Thermometer, Droplets, Wind, Mountain, Calendar, MapPin,
   Flame, Settings2, Package, Layers, Zap, Wrench, TriangleAlert,
-  ThumbsUp, ShowerHead, Hand, Flag, Calculator, Eye, Download, Upload, RefreshCw, User
+  Hand, Flag, Calculator, Eye, Download, Upload, RefreshCw, User
 } from "lucide-react";
 
 const TYPE_LABELS = { nobox: "No Box", box: "Box", elliot: "Elliot" };
@@ -392,6 +392,29 @@ export default function NovaRunTracker() {
     return map;
   }, [runs]);
 
+  // For each lifted run, how much slower its 330-1/8 segment was than the
+  // last full (non-lifted) run of the same type before it — the projected
+  // time the lift cost. Non-lifted runs get no value (they just show "Full").
+  const liftProjection = useMemo(() => {
+    const sorted = [...runs].sort((a, b) => {
+      const ta = runTimestamp(a);
+      const tb = runTimestamp(b);
+      return ta !== tb ? ta - tb : (a.createdAt || 0) - (b.createdAt || 0);
+    });
+    const map = {};
+    const lastFullSegByType = {};
+    for (const r of sorted) {
+      const { seg330_8th } = computeSegments(r);
+      if (r.lifted) {
+        const lastFull = lastFullSegByType[r.type];
+        map[r.id] = lastFull != null && seg330_8th != null ? lastFull - seg330_8th : null;
+      } else if (seg330_8th != null) {
+        lastFullSegByType[r.type] = seg330_8th;
+      }
+    }
+    return map;
+  }, [runs]);
+
   const stats = useMemo(() => {
     if (visibleRuns.length === 0) return null;
     const wins = visibleRuns.filter((r) => r.result === "win").length;
@@ -610,6 +633,7 @@ export default function NovaRunTracker() {
               onDelete={() => setConfirmDeleteId(run.id)}
               showTypeBadge={tab === "all"}
               sincePrevMs={timeSincePrev[run.id]}
+              liftDiff={liftProjection[run.id]}
             />
           ))
         )}
@@ -727,12 +751,15 @@ export default function NovaRunTracker() {
 
 const RESULT_LABEL = { trial: "Time Trial", win: "Win", lose: "Lose" };
 
-function RunCard({ run, expanded, onToggle, onEdit, onDelete, showTypeBadge, sincePrevMs }) {
+function RunCard({ run, expanded, onToggle, onEdit, onDelete, showTypeBadge, sincePrevMs, liftDiff }) {
   const { seg60_330, seg330_8th } = computeSegments(run);
   const pkgInfo = packageDisplay(run);
   const hasDial = run.dialIn !== "" && run.dialIn !== null && run.dialIn !== undefined && !isNaN(parseFloat(run.dialIn));
   const gapText =
     sincePrevMs != null && sincePrevMs >= 0 && sincePrevMs <= MAX_GAP_MS ? formatGap(sincePrevMs) : null;
+  const liftLabel = run.lifted
+    ? `Lift${liftDiff != null ? ` ${liftDiff >= 0 ? "+" : ""}${liftDiff.toFixed(3)}` : ""}`
+    : "Full";
 
   return (
     <div className="bg-zinc-900 border border-zinc-800 rounded-xl overflow-hidden">
@@ -759,10 +786,20 @@ function RunCard({ run, expanded, onToggle, onEdit, onDelete, showTypeBadge, sin
             )}
           </div>
           <div className="flex items-center gap-1.5 shrink-0 pl-2">
-            {run.lifted && <Hand size={13} className="text-amber-400" />}
+            <span
+              className={`text-[10px] font-display uppercase tracking-wide ${
+                run.lifted ? "text-amber-400" : "text-zinc-500"
+              }`}
+            >
+              {liftLabel}
+            </span>
             {run.serviceNote && <Wrench size={12} className="text-emerald-400" />}
-            {run.result === "win" && <ThumbsUp size={13} className="text-emerald-400" />}
-            {run.result === "lose" && <ShowerHead size={13} className="text-red-400" />}
+            {run.result === "win" && (
+              <span className="text-[10px] font-display uppercase tracking-wide text-emerald-400">Win</span>
+            )}
+            {run.result === "lose" && (
+              <span className="text-[10px] font-display uppercase tracking-wide text-red-400">Loss</span>
+            )}
             {run.result === "trial" && <Flag size={13} className="text-zinc-400" />}
             {expanded ? <ChevronUp size={16} className="text-zinc-500" /> : <ChevronDown size={16} className="text-zinc-500" />}
           </div>
