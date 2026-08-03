@@ -4,7 +4,7 @@ import {
   Plus, X, Trash2, Pencil, ChevronDown, ChevronUp, Check,
   Thermometer, Droplets, Wind, Mountain, Calendar, MapPin,
   Flame, Settings2, Package, Layers, Zap, Wrench, TriangleAlert,
-  Trophy, ThumbsDown, Flag, Calculator, Eye, Download, Upload, RefreshCw, User
+  ThumbsUp, ShowerHead, Hand, Flag, Calculator, Eye, Download, Upload, RefreshCw, User
 } from "lucide-react";
 
 const TYPE_LABELS = { nobox: "No Box", box: "Box", elliot: "Elliot" };
@@ -30,6 +30,16 @@ const runTimestamp = (r) => {
   const t = r.time && /^\d{2}:\d{2}$/.test(r.time) ? r.time : "00:00";
   const ts = new Date(`${r.date}T${t}:00`).getTime();
   return isNaN(ts) ? 0 : ts;
+};
+
+const MAX_GAP_MS = 14 * 60 * 60 * 1000;
+
+const formatGap = (ms) => {
+  const totalMin = Math.round(ms / 60000);
+  const h = Math.floor(totalMin / 60);
+  const m = totalMin % 60;
+  if (h > 0) return `${h}h ${m}m`;
+  return `${m}m`;
 };
 
 const fmt = (v, d = 3) => {
@@ -89,8 +99,24 @@ function computeSegments(run) {
 function computePackage(run) {
   const dial = parseFloat(run.dialIn);
   const eighth = parseFloat(run.eighth);
-  if (isNaN(dial) || isNaN(eighth)) return null;
-  return eighth - dial;
+  const rt = parseFloat(run.rt);
+  if (isNaN(dial) || isNaN(eighth) || isNaN(rt)) return null;
+  return rt + (eighth - dial);
+}
+
+// Package = reaction time + how far off the dial-in you were. A negative RT
+// is a foul (red light) and running quicker than the dial is a breakout —
+// both override the numeric package since the run result is voided either way.
+function packageDisplay(run) {
+  const dial = parseFloat(run.dialIn);
+  const eighth = parseFloat(run.eighth);
+  const rt = parseFloat(run.rt);
+  const hasDial = run.dialIn !== "" && run.dialIn !== null && run.dialIn !== undefined && !isNaN(dial);
+  if (!isNaN(rt) && rt < 0) return { text: "Red", tone: "red" };
+  if (hasDial && !isNaN(eighth) && eighth < dial) return { text: "Brkout", tone: "red" };
+  const pkg = computePackage(run);
+  if (pkg == null) return { text: "—", tone: undefined };
+  return { text: `${pkg >= 0 ? "+" : ""}${pkg.toFixed(3)}`, tone: "green" };
 }
 
 // Green (fast/best) -> Red (slow/worst) gradient for a value within a day's range
@@ -160,13 +186,13 @@ export default function NovaRunTracker() {
     });
     const rows = sorted.map((r) => {
       const { seg60_330, seg330_8th } = computeSegments(r);
-      const pkg = computePackage(r);
+      const pkgInfo = packageDisplay(r);
       return [
         r.date, r.time || "", typeLabel(r.type), r.track,
         r.rt, r.sixty, r.threeThirty, r.eighth, r.mph, r.dialIn, r.delay,
         seg60_330 == null ? "" : seg60_330.toFixed(3),
         seg330_8th == null ? "" : seg330_8th.toFixed(3),
-        pkg == null ? "" : pkg.toFixed(3),
+        pkgInfo.text === "—" ? "" : pkgInfo.text,
         r.lifted ? "Yes" : "No",
         r.result || "",
         r.temp, r.humidity, r.waterGrains, r.da, r.serviceNote,
@@ -350,6 +376,21 @@ export default function NovaRunTracker() {
       return (b.createdAt || 0) - (a.createdAt || 0);
     });
   }, [runs, tab]);
+
+  // Gap to the previous run across ALL types (the car's actual last time at
+  // the track), keyed by run id, regardless of which tab is being viewed.
+  const timeSincePrev = useMemo(() => {
+    const sorted = [...runs].sort((a, b) => {
+      const ta = runTimestamp(a);
+      const tb = runTimestamp(b);
+      return ta !== tb ? ta - tb : (a.createdAt || 0) - (b.createdAt || 0);
+    });
+    const map = {};
+    for (let i = 1; i < sorted.length; i++) {
+      map[sorted[i].id] = runTimestamp(sorted[i]) - runTimestamp(sorted[i - 1]);
+    }
+    return map;
+  }, [runs]);
 
   const stats = useMemo(() => {
     if (visibleRuns.length === 0) return null;
@@ -568,6 +609,7 @@ export default function NovaRunTracker() {
               onEdit={() => openEdit(run)}
               onDelete={() => setConfirmDeleteId(run.id)}
               showTypeBadge={tab === "all"}
+              sincePrevMs={timeSincePrev[run.id]}
             />
           ))
         )}
@@ -685,10 +727,12 @@ export default function NovaRunTracker() {
 
 const RESULT_LABEL = { trial: "Time Trial", win: "Win", lose: "Lose" };
 
-function RunCard({ run, expanded, onToggle, onEdit, onDelete, showTypeBadge }) {
+function RunCard({ run, expanded, onToggle, onEdit, onDelete, showTypeBadge, sincePrevMs }) {
   const { seg60_330, seg330_8th } = computeSegments(run);
-  const pkg = computePackage(run);
+  const pkgInfo = packageDisplay(run);
   const hasDial = run.dialIn !== "" && run.dialIn !== null && run.dialIn !== undefined && !isNaN(parseFloat(run.dialIn));
+  const gapText =
+    sincePrevMs != null && sincePrevMs >= 0 && sincePrevMs <= MAX_GAP_MS ? formatGap(sincePrevMs) : null;
 
   return (
     <div className="bg-zinc-900 border border-zinc-800 rounded-xl overflow-hidden">
@@ -696,7 +740,12 @@ function RunCard({ run, expanded, onToggle, onEdit, onDelete, showTypeBadge }) {
         <div className="flex items-center justify-between pl-3 pr-2 pt-2">
           <div className="flex-1 min-w-0 flex items-center gap-1.5 text-[10px] text-zinc-500">
             <span className="font-num shrink-0">{fmtDate(run.date)}</span>
-            {run.time && <span className="font-num shrink-0 text-zinc-600">{fmtTime(run.time)}</span>}
+            {run.time && (
+              <span className="font-num shrink-0 text-zinc-600">
+                {fmtTime(run.time)}
+                {gapText && ` (${gapText})`}
+              </span>
+            )}
             <span className="text-zinc-700 shrink-0">·</span>
             <span className="truncate">{run.track || "—"}</span>
             {showTypeBadge && (
@@ -710,10 +759,10 @@ function RunCard({ run, expanded, onToggle, onEdit, onDelete, showTypeBadge }) {
             )}
           </div>
           <div className="flex items-center gap-1.5 shrink-0 pl-2">
-            {run.lifted && <TriangleAlert size={13} className="text-red-400" />}
+            {run.lifted && <Hand size={13} className="text-amber-400" />}
             {run.serviceNote && <Wrench size={12} className="text-emerald-400" />}
-            {run.result === "win" && <Trophy size={13} className="text-emerald-400" />}
-            {run.result === "lose" && <ThumbsDown size={13} className="text-red-400" />}
+            {run.result === "win" && <ThumbsUp size={13} className="text-emerald-400" />}
+            {run.result === "lose" && <ShowerHead size={13} className="text-red-400" />}
             {run.result === "trial" && <Flag size={13} className="text-zinc-400" />}
             {expanded ? <ChevronUp size={16} className="text-zinc-500" /> : <ChevronDown size={16} className="text-zinc-500" />}
           </div>
@@ -727,6 +776,8 @@ function RunCard({ run, expanded, onToggle, onEdit, onDelete, showTypeBadge }) {
           <CompactStat label="60-330" value={fmt(seg60_330)} tone="amber" />
           <CompactStat label="1/8 ET" value={fmt(run.eighth)} tone="bright" />
           <CompactStat label="MPH" value={fmt(run.mph, 2)} />
+          <CompactStat label="330-1/8" value={fmt(seg330_8th)} tone="amber" />
+          <CompactStat label="Package" value={pkgInfo.text} tone={pkgInfo.tone} />
         </div>
       </button>
 
@@ -734,15 +785,7 @@ function RunCard({ run, expanded, onToggle, onEdit, onDelete, showTypeBadge }) {
         <div className="px-4 pb-4 pt-1 border-t border-zinc-800 mt-1">
           <div className="grid grid-cols-2 gap-2 mb-3 mt-3">
             <Stat label="330-1/8 seg" value={fmt(seg330_8th)} accent={!run.lifted} tone={run.lifted ? "red" : undefined} />
-            {hasDial ? (
-              <Stat
-                label="Package"
-                value={pkg == null ? "—" : `${pkg >= 0 ? "+" : ""}${fmt(pkg)}`}
-                tone={pkg == null ? undefined : pkg < 0 ? "red" : "green"}
-              />
-            ) : (
-              <div />
-            )}
+            <Stat label="Package" value={pkgInfo.text} tone={pkgInfo.tone} />
           </div>
 
           {run.type === "box" && (
@@ -767,8 +810,8 @@ function RunCard({ run, expanded, onToggle, onEdit, onDelete, showTypeBadge }) {
               </span>
             )}
             {run.lifted && (
-              <div className="flex items-center gap-1.5 text-[11px] text-red-400 bg-red-950/50 border border-red-900 rounded-lg px-2 py-1">
-                <TriangleAlert size={11} />
+              <div className="flex items-center gap-1.5 text-[11px] text-amber-400 bg-amber-950/50 border border-amber-900 rounded-lg px-2 py-1">
+                <Hand size={11} />
                 <span>Lifted</span>
               </div>
             )}
@@ -807,7 +850,12 @@ function RunCard({ run, expanded, onToggle, onEdit, onDelete, showTypeBadge }) {
 }
 
 function CompactStat({ label, value, tone }) {
-  const color = tone === "amber" ? "text-amber-400" : tone === "bright" ? "text-zinc-50" : "text-zinc-300";
+  const color =
+    tone === "amber" ? "text-amber-400" :
+    tone === "bright" ? "text-zinc-50" :
+    tone === "red" ? "text-red-400" :
+    tone === "green" ? "text-emerald-400" :
+    "text-zinc-300";
   return (
     <div className="shrink-0 w-14 bg-zinc-950 border border-zinc-800 rounded-md py-1 text-center">
       <div className="text-[8px] uppercase tracking-wide text-zinc-500 leading-none">{label}</div>
