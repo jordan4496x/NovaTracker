@@ -4,7 +4,8 @@ import {
   Plus, X, Trash2, Pencil, ChevronDown, ChevronUp, Check,
   Thermometer, Droplets, Wind, Mountain, Calendar, MapPin,
   Flame, Settings2, Package, Layers, Zap, Wrench, TriangleAlert,
-  Hand, Flag, Calculator, Eye, Download, Upload, RefreshCw, User
+  Hand, Flag, Calculator, Eye, Download, Upload, RefreshCw, User,
+  Camera, Image as ImageIcon
 } from "lucide-react";
 
 const TYPE_LABELS = { nobox: "No Box", box: "Box", elliot: "Elliot" };
@@ -937,8 +938,61 @@ function Field({ label, value, onChange, type = "text", placeholder }) {
   );
 }
 
+const SCAN_FIELDS = ["dialIn", "rt", "sixty", "threeThirty", "eighth", "mph"];
+
 function RunSheet({ form, setForm, onSave, onClose, bigText, setBigText }) {
   const set = (key) => (val) => setForm({ ...form, [key]: val });
+
+  const [scanning, setScanning] = useState(false);
+  const [scanError, setScanError] = useState("");
+  const cameraInputRef = useRef(null);
+  const libraryInputRef = useRef(null);
+
+  const fileToBase64 = (file) =>
+    new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result).split(",")[1] || "");
+      reader.onerror = () => reject(new Error("Couldn't read that file."));
+      reader.readAsDataURL(file);
+    });
+
+  const handleScanFile = async (e) => {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = "";
+    if (!file) return;
+    setScanError("");
+    setScanning(true);
+    try {
+      const base64 = await fileToBase64(file);
+      const res = await fetch("/api/scan-timeslip", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          image: base64,
+          mediaType: file.type || "image/jpeg",
+          lane: form.lane === "L" ? "Left" : "Right",
+        }),
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok) {
+        throw new Error((data && data.error) || "Scan failed. Try again or enter the run manually.");
+      }
+      const updates = {};
+      SCAN_FIELDS.forEach((key) => {
+        if (typeof data?.[key] === "string" && data[key].trim() !== "") {
+          updates[key] = data[key];
+        }
+      });
+      if (Object.keys(updates).length === 0) {
+        setScanError("Couldn't confidently read any values from that slip — enter them manually.");
+      }
+      setForm((f) => ({ ...f, ...updates }));
+    } catch (err) {
+      setScanError(err.message || "Couldn't read that slip. Try again or enter manually.");
+    } finally {
+      setScanning(false);
+    }
+  };
 
   return (
     <div className="fixed inset-0 z-40 bg-black/70 flex items-end">
@@ -987,7 +1041,7 @@ function RunSheet({ form, setForm, onSave, onClose, bigText, setBigText }) {
 
         <div className="mb-3">
           <div className="text-[10px] uppercase tracking-wide text-zinc-500 mb-1.5">Lane</div>
-          <div className="flex gap-2">
+          <div className="flex gap-2 mb-2">
             {["R", "L"].map((laneKey) => (
               <button
                 key={laneKey}
@@ -1008,6 +1062,50 @@ function RunSheet({ form, setForm, onSave, onClose, bigText, setBigText }) {
               </button>
             ))}
           </div>
+
+          <div className="text-[10px] uppercase tracking-wide text-zinc-500 mb-1.5">Scan Timeslip (optional)</div>
+          <div className="flex gap-2">
+            <button
+              type="button"
+              disabled={scanning}
+              onClick={() => cameraInputRef.current && cameraInputRef.current.click()}
+              className="flex-1 flex items-center justify-center gap-1.5 py-2 rounded-lg bg-zinc-900 border border-zinc-800 text-zinc-300 text-xs font-medium disabled:opacity-50"
+            >
+              <Camera size={14} />
+              Take Photo
+            </button>
+            <button
+              type="button"
+              disabled={scanning}
+              onClick={() => libraryInputRef.current && libraryInputRef.current.click()}
+              className="flex-1 flex items-center justify-center gap-1.5 py-2 rounded-lg bg-zinc-900 border border-zinc-800 text-zinc-300 text-xs font-medium disabled:opacity-50"
+            >
+              <ImageIcon size={14} />
+              Choose from Library
+            </button>
+          </div>
+          <input
+            ref={cameraInputRef}
+            type="file"
+            accept="image/*"
+            capture="environment"
+            onChange={handleScanFile}
+            className="hidden"
+          />
+          <input
+            ref={libraryInputRef}
+            type="file"
+            accept="image/*"
+            onChange={handleScanFile}
+            className="hidden"
+          />
+          {scanning && (
+            <div className="flex items-center gap-1.5 text-[11px] text-amber-400 mt-2">
+              <RefreshCw size={12} className="animate-spin" />
+              Reading slip...
+            </div>
+          )}
+          {scanError && !scanning && <div className="text-[11px] text-red-400 mt-2">{scanError}</div>}
         </div>
 
         <div className="grid grid-cols-3 gap-3 mb-3">
