@@ -807,7 +807,7 @@ function RunCard({ run, expanded, onToggle, onEdit, onDelete, showTypeBadge, sin
         </div>
 
         <div className="hide-scrollbar overflow-x-auto flex gap-1.5 px-3 pt-1.5 pb-2">
-          <CompactStat label="Dial" value={hasDial ? fmt(run.dialIn) : "—"} />
+          <CompactStat label="Dial" value={hasDial ? fmt(run.dialIn, 2) : "—"} />
           <CompactStat label="RT" value={fmt(run.rt)} />
           <CompactStat label="60'" value={fmt(run.sixty)} />
           <CompactStat label="330'" value={fmt(run.threeThirty)} />
@@ -1120,7 +1120,7 @@ function RunSheet({ form, setForm, onSave, onClose, bigText, setBigText }) {
         </div>
 
         <div className="grid grid-cols-2 gap-3 mb-3">
-          <Field label="Dial-In (optional)" type="number" value={form.dialIn} onChange={set("dialIn")} placeholder="0.000" />
+          <Field label="Dial-In (optional)" type="number" value={form.dialIn} onChange={set("dialIn")} placeholder="0.00" />
           {form.type === "box" && (
             <Field label="Delay *" type="number" value={form.delay} onChange={set("delay")} placeholder="0.000" />
           )}
