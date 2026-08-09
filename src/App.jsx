@@ -548,28 +548,29 @@ export default function NovaRunTracker() {
   const [predictTime, setPredictTime] = useState(nowTimeStr());
 
   // Run Predictor: closest full (non-lifted) run at this exact track for a
-  // clean 330-1/8 segment, plus separately the closest run at this track
-  // (lifted or not — lifting doesn't corrupt the 60-330 phase) for the
-  // 60-330 segment. Added together for a projected 1/8 ET. Never crosses
-  // tracks. "Closest" = nearest calendar date (ignoring year), ties broken
-  // by time of day.
+  // clean 330-1/8 segment, plus separately the actual 330' time from the
+  // closest run at this track (lifted or not — lifting doesn't corrupt the
+  // 330' trap since it happens later). Added together for a projected 1/8
+  // ET, same idea as Run Completion but sourcing the 330' time from history
+  // instead of a manual entry. Never crosses tracks. "Closest" = nearest
+  // calendar date (ignoring year), ties broken by time of day.
   const runPrediction = useMemo(() => {
     if (!predictTrack) return null;
     const atTrack = runs.filter((r) => r.track === predictTrack);
     const fullCandidates = atTrack.filter((r) => !r.lifted && computeSegments(r).seg330_8th != null);
-    const segCandidates = atTrack.filter((r) => computeSegments(r).seg60_330 != null);
+    const threeThirtyCandidates = atTrack.filter((r) => !isNaN(parseFloat(r.threeThirty)));
 
     const seg330_8thRun = findClosestRun(fullCandidates, predictDate, predictTime);
-    const seg60_330Run = findClosestRun(segCandidates, predictDate, predictTime);
+    const threeThirtyRun = findClosestRun(threeThirtyCandidates, predictDate, predictTime);
 
-    if (!seg330_8thRun && !seg60_330Run) return { value: null, missing: "both" };
+    if (!seg330_8thRun && !threeThirtyRun) return { value: null, missing: "both" };
     if (!seg330_8thRun) return { value: null, missing: "segment330" };
-    if (!seg60_330Run) return { value: null, missing: "segment60330" };
+    if (!threeThirtyRun) return { value: null, missing: "threeThirty" };
 
     const seg330_8th = computeSegments(seg330_8thRun).seg330_8th;
-    const seg60_330 = computeSegments(seg60_330Run).seg60_330;
+    const threeThirty = parseFloat(threeThirtyRun.threeThirty);
 
-    return { value: seg60_330 + seg330_8th, seg60_330, seg60_330Run, seg330_8th, seg330_8thRun };
+    return { value: threeThirty + seg330_8th, threeThirty, threeThirtyRun, seg330_8th, seg330_8thRun };
   }, [runs, predictTrack, predictDate, predictTime]);
 
   const serviceLog = useMemo(() => {
@@ -1539,7 +1540,7 @@ function PredictionPanel({
               ? `No runs recorded yet at ${predictTrack}.`
               : runPrediction?.missing === "segment330"
               ? `No non-lifted runs recorded yet at ${predictTrack} to source a clean 330-1/8 segment.`
-              : `Not enough 60-330 data recorded yet at ${predictTrack}.`}
+              : `No 330' time recorded yet at ${predictTrack}.`}
           </div>
         ) : (
           <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-5 text-center">
@@ -1549,8 +1550,8 @@ function PredictionPanel({
             </div>
             <div className="text-[11px] text-zinc-500 mt-3 space-y-0.5">
               <div>
-                60-330 seg {fmt(runPrediction.seg60_330)} · {fmtDate(runPrediction.seg60_330Run.date)}{" "}
-                {fmtTime(runPrediction.seg60_330Run.time)}
+                330' time {fmt(runPrediction.threeThirty)} · {fmtDate(runPrediction.threeThirtyRun.date)}{" "}
+                {fmtTime(runPrediction.threeThirtyRun.time)}
               </div>
               <div>
                 330-1/8 seg {fmt(runPrediction.seg330_8th)} (full run) · {fmtDate(runPrediction.seg330_8thRun.date)}{" "}
@@ -1562,7 +1563,8 @@ function PredictionPanel({
 
         <div className="text-[10px] text-zinc-600 mt-4 leading-relaxed">
           Finds the closest full (non-lifted) run at this track for a clean 330-1/8 segment, and separately the
-          closest run at this track (lifted or not) for the 60-330 segment, then adds them together. Never crosses
+          actual 330' time from the closest run at this track (lifted or not), then adds them together — same idea
+          as Run Completion above, but the 330' time comes from history instead of a manual entry. Never crosses
           tracks. "Closest" means nearest calendar date first (ignoring year), using time of day only to break ties.
         </div>
       </div>
