@@ -19,6 +19,17 @@ const typeBadgeClass = (type) => TYPE_BADGE_CLASSES[type] || TYPE_BADGE_CLASSES.
 
 const RUNS_KEY = "novalog-runs";
 const COMPONENTS_KEY = "novalog-components";
+const TRACKS_KEY = "novalog-tracks";
+
+const DEFAULT_TRACKS = [
+  "Beacon Dragway",
+  "Beech Bend Raceway Park",
+  "Bristol Dragway",
+  "Ethridge Motorsports Park",
+  "Holly Springs Motorsports",
+  "Montgomery Motorsports",
+  "Music City Raceway",
+];
 
 const todayStr = () => new Date().toISOString().slice(0, 10);
 const nowTimeStr = () => {
@@ -41,6 +52,54 @@ const formatGap = (ms) => {
   const m = totalMin % 60;
   if (h > 0) return `${h}h ${m}m`;
   return `${m}m`;
+};
+
+// Day-of-year distance (ignoring year, wraps around Dec 31 -> Jan 1) and
+// time-of-day distance (wraps around midnight), used to find the "closest"
+// historical run for Run Predictor.
+const dayOfYear = (dateStr) => {
+  const [y, m, d] = dateStr.split("-").map(Number);
+  return Math.round((Date.UTC(y, m - 1, d) - Date.UTC(y, 0, 1)) / 86400000);
+};
+
+const circularDayDistance = (dateA, dateB) => {
+  const YEAR_LEN = 365;
+  const a = dayOfYear(dateA) % YEAR_LEN;
+  const b = dayOfYear(dateB) % YEAR_LEN;
+  const diff = Math.abs(a - b);
+  return Math.min(diff, YEAR_LEN - diff);
+};
+
+const minutesOfDay = (timeStr) => {
+  if (!timeStr) return null;
+  const [h, m] = timeStr.split(":").map(Number);
+  if (isNaN(h) || isNaN(m)) return null;
+  return h * 60 + m;
+};
+
+const circularMinuteDistance = (a, b) => {
+  if (a == null || b == null) return Infinity;
+  const diff = Math.abs(a - b);
+  return Math.min(diff, 1440 - diff);
+};
+
+// Closest by calendar date first (ignoring year); time-of-day only breaks ties.
+const findClosestRun = (candidates, targetDate, targetTime) => {
+  if (candidates.length === 0) return null;
+  const targetMin = minutesOfDay(targetTime);
+  let best = null;
+  let bestDateDist = Infinity;
+  let bestTimeDist = Infinity;
+  for (const r of candidates) {
+    const dDist = circularDayDistance(r.date, targetDate);
+    const tDist = circularMinuteDistance(minutesOfDay(r.time), targetMin);
+    if (dDist < bestDateDist || (dDist === bestDateDist && tDist < bestTimeDist)) {
+      best = r;
+      bestDateDist = dDist;
+      bestTimeDist = tDist;
+    }
+  }
+  return best;
 };
 
 const fmt = (v, d = 3) => {
@@ -137,6 +196,7 @@ export default function NovaRunTracker() {
   const [loaded, setLoaded] = useState(false);
   const [runs, setRuns] = useState([]);
   const [components, setComponents] = useState([]);
+  const [tracks, setTracks] = useState(DEFAULT_TRACKS);
   const [tab, setTab] = useState("nobox"); // nobox | box | all | setup
   const [sheetOpen, setSheetOpen] = useState(false);
   const [form, setForm] = useState(emptyForm("nobox"));
@@ -259,10 +319,26 @@ export default function NovaRunTracker() {
         { id: "tires", name: "Tires", sinceRuns: 0, history: [], createdAt: Date.now() },
       ];
     }
+    let loadedTracks = null;
+    try {
+      const t = await storage.get(TRACKS_KEY);
+      if (t && t.value) loadedTracks = JSON.parse(t.value);
+    } catch (e) {}
+    if (!loadedTracks || loadedTracks.length === 0) loadedTracks = DEFAULT_TRACKS;
+    // Self-heal: make sure any track name already used on a run is always
+    // selectable, even if it predates the tracks list or came from an import.
+    const runTracks = Array.from(new Set(loadedRuns.map((r) => r.track).filter(Boolean)));
+    const mergedTracks = Array.from(new Set([...loadedTracks, ...runTracks])).sort((a, b) => a.localeCompare(b));
+
     setRuns(loadedRuns);
     setComponents(loadedComponents);
+    setTracks(mergedTracks);
     setLoaded(true);
     setSyncing(false);
+
+    if (mergedTracks.length !== loadedTracks.length) {
+      persistTracks(mergedTracks);
+    }
   };
 
   useEffect(() => {
@@ -290,6 +366,22 @@ export default function NovaRunTracker() {
     try {
       await storage.set(COMPONENTS_KEY, JSON.stringify(next));
     } catch (e) {}
+  };
+
+  const persistTracks = async (next) => {
+    setTracks(next);
+    try {
+      await storage.set(TRACKS_KEY, JSON.stringify(next));
+    } catch (e) {}
+  };
+
+  const addTrack = async (name) => {
+    const trimmed = name.trim();
+    if (!trimmed) return "";
+    if (!tracks.includes(trimmed)) {
+      await persistTracks([...tracks, trimmed].sort((a, b) => a.localeCompare(b)));
+    }
+    return trimmed;
   };
 
   const lastTrack = useMemo(() => {
@@ -451,6 +543,35 @@ export default function NovaRunTracker() {
       ? parseFloat(predInput) + predStats.avg
       : null;
 
+  const [predictTrack, setPredictTrack] = useState("");
+  const [predictDate, setPredictDate] = useState(todayStr());
+  const [predictTime, setPredictTime] = useState(nowTimeStr());
+
+  // Run Predictor: closest full (non-lifted) run at this exact track for a
+  // clean 330-1/8 segment, plus separately the closest run at this track
+  // (lifted or not — lifting doesn't corrupt the 60-330 phase) for the
+  // 60-330 segment. Added together for a projected 1/8 ET. Never crosses
+  // tracks. "Closest" = nearest calendar date (ignoring year), ties broken
+  // by time of day.
+  const runPrediction = useMemo(() => {
+    if (!predictTrack) return null;
+    const atTrack = runs.filter((r) => r.track === predictTrack);
+    const fullCandidates = atTrack.filter((r) => !r.lifted && computeSegments(r).seg330_8th != null);
+    const segCandidates = atTrack.filter((r) => computeSegments(r).seg60_330 != null);
+
+    const seg330_8thRun = findClosestRun(fullCandidates, predictDate, predictTime);
+    const seg60_330Run = findClosestRun(segCandidates, predictDate, predictTime);
+
+    if (!seg330_8thRun && !seg60_330Run) return { value: null, missing: "both" };
+    if (!seg330_8thRun) return { value: null, missing: "segment330" };
+    if (!seg60_330Run) return { value: null, missing: "segment60330" };
+
+    const seg330_8th = computeSegments(seg330_8thRun).seg330_8th;
+    const seg60_330 = computeSegments(seg60_330Run).seg60_330;
+
+    return { value: seg60_330 + seg330_8th, seg60_330, seg60_330Run, seg330_8th, seg330_8thRun };
+  }, [runs, predictTrack, predictDate, predictTime]);
+
   const serviceLog = useMemo(() => {
     return runs
       .filter((r) => r.serviceNote && r.serviceNote.trim())
@@ -561,7 +682,7 @@ export default function NovaRunTracker() {
           </div>
         ) : (
           <div className="text-[11px] text-zinc-500">
-            {tab === "all" ? "All logged runs, newest first" : tab === "predict" ? "Estimate a lifted run's true ET" : "Component counters & service log"}
+            {tab === "all" ? "All logged runs, newest first" : tab === "predict" ? "Complete a lifted run, or predict a future one" : "Component counters & service log"}
           </div>
         )}
       </div>
@@ -616,6 +737,15 @@ export default function NovaRunTracker() {
             predInput={predInput}
             setPredInput={setPredInput}
             predicted={predicted}
+            tracks={tracks}
+            onAddTrack={addTrack}
+            predictTrack={predictTrack}
+            setPredictTrack={setPredictTrack}
+            predictDate={predictDate}
+            setPredictDate={setPredictDate}
+            predictTime={predictTime}
+            setPredictTime={setPredictTime}
+            runPrediction={runPrediction}
           />
         ) : visibleRuns.length === 0 ? (
           <div className="text-center py-16 text-zinc-500">
@@ -744,6 +874,8 @@ export default function NovaRunTracker() {
           onClose={() => setSheetOpen(false)}
           bigText={bigText}
           setBigText={setBigText}
+          tracks={tracks}
+          onAddTrack={addTrack}
         />
       )}
     </div>
@@ -938,9 +1070,82 @@ function Field({ label, value, onChange, type = "text", placeholder }) {
   );
 }
 
+// Shared track dropdown used everywhere a track is picked. Lets the user add
+// a brand new track inline, which persists it to the shared track list.
+function TrackSelect({ tracks, value, onChange, onAddTrack }) {
+  const [adding, setAdding] = useState(false);
+  const [newName, setNewName] = useState("");
+
+  const options = value && !tracks.includes(value) ? [value, ...tracks] : tracks;
+
+  const confirmAdd = async () => {
+    const trimmed = newName.trim();
+    setAdding(false);
+    setNewName("");
+    if (!trimmed) return;
+    await onAddTrack(trimmed);
+    onChange(trimmed);
+  };
+
+  if (adding) {
+    return (
+      <div className="flex gap-2">
+        <input
+          autoFocus
+          value={newName}
+          onChange={(e) => setNewName(e.target.value)}
+          placeholder="New track name"
+          className="flex-1 bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2 text-sm font-num text-zinc-100 focus:outline-none focus:border-amber-500"
+        />
+        <button
+          type="button"
+          onClick={confirmAdd}
+          className="px-3 py-2 rounded-lg bg-amber-400 text-zinc-950 text-xs font-medium"
+        >
+          Add
+        </button>
+        <button
+          type="button"
+          onClick={() => {
+            setAdding(false);
+            setNewName("");
+          }}
+          className="px-3 py-2 rounded-lg bg-zinc-800 text-zinc-300 text-xs font-medium"
+        >
+          Cancel
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <select
+      value={value || ""}
+      onChange={(e) => {
+        if (e.target.value === "__add__") {
+          setAdding(true);
+          return;
+        }
+        onChange(e.target.value);
+      }}
+      className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2 text-sm font-num text-zinc-100 focus:outline-none focus:border-amber-500"
+    >
+      <option value="" disabled>
+        Select a track
+      </option>
+      {options.map((t) => (
+        <option key={t} value={t}>
+          {t}
+        </option>
+      ))}
+      <option value="__add__">+ Add new track…</option>
+    </select>
+  );
+}
+
 const SCAN_FIELDS = ["dialIn", "rt", "sixty", "threeThirty", "eighth", "mph"];
 
-function RunSheet({ form, setForm, onSave, onClose, bigText, setBigText }) {
+function RunSheet({ form, setForm, onSave, onClose, bigText, setBigText, tracks, onAddTrack }) {
   const set = (key) => (val) => setForm({ ...form, [key]: val });
 
   const [scanning, setScanning] = useState(false);
@@ -1036,7 +1241,8 @@ function RunSheet({ form, setForm, onSave, onClose, bigText, setBigText }) {
           <Field label="Time" type="time" value={form.time} onChange={set("time")} />
         </div>
         <div className="mb-3">
-          <Field label="Track" value={form.track} onChange={set("track")} placeholder="e.g. Fairfield Glade" />
+          <div className="text-[10px] uppercase tracking-wide text-zinc-500 mb-1">Track</div>
+          <TrackSelect tracks={tracks} value={form.track} onChange={set("track")} onAddTrack={onAddTrack} />
         </div>
 
         <div className="mb-3">
@@ -1209,67 +1415,156 @@ function RunSheet({ form, setForm, onSave, onClose, bigText, setBigText }) {
   );
 }
 
-function PredictionPanel({ availableDates, effectivePredDate, setPredDate, predStats, predInput, setPredInput, predicted }) {
-  if (availableDates.length === 0) {
-    return (
-      <div className="text-center py-16 text-zinc-500">
-        <Calculator className="mx-auto mb-3 text-zinc-700" size={28} />
-        <div className="font-display uppercase tracking-wide text-sm">No runs logged yet</div>
-        <div className="text-xs mt-1">Log a few runs, then come back here to predict a lifted run's true ET.</div>
-      </div>
-    );
-  }
-
+function PredictionPanel({
+  availableDates,
+  effectivePredDate,
+  setPredDate,
+  predStats,
+  predInput,
+  setPredInput,
+  predicted,
+  tracks,
+  onAddTrack,
+  predictTrack,
+  setPredictTrack,
+  predictDate,
+  setPredictDate,
+  predictTime,
+  setPredictTime,
+  runPrediction,
+}) {
   return (
     <div>
-      <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-4 mb-3">
-        <div className="text-[10px] uppercase tracking-wide text-zinc-500 mb-1.5">Race Day</div>
-        <select
-          value={effectivePredDate}
-          onChange={(e) => setPredDate(e.target.value)}
-          className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2 text-sm font-num text-zinc-100 focus:outline-none focus:border-amber-500"
-        >
-          {availableDates.map((d) => (
-            <option key={d} value={d}>
-              {fmtDate(d)}
-            </option>
-          ))}
-        </select>
+      <div className="text-[11px] uppercase tracking-wide text-zinc-500 mb-2 font-display">Run Completion</div>
 
-        <div className="mt-4">
-          <div className="text-[10px] uppercase tracking-wide text-zinc-500 mb-1.5">330' Time</div>
-          <input
-            type="number"
-            inputMode="decimal"
-            value={predInput}
-            onChange={(e) => setPredInput(e.target.value)}
-            placeholder="e.g. 4.85"
-            className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2 text-sm font-num text-zinc-100 focus:outline-none focus:border-amber-500"
-          />
-        </div>
-      </div>
-
-      {predStats.count === 0 ? (
-        <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-4 text-xs text-zinc-500">
-          No non-lifted runs logged on {fmtDate(effectivePredDate)} yet, so there's no clean 330-1/8 segment to base a prediction on.
+      {availableDates.length === 0 ? (
+        <div className="text-center py-10 text-zinc-500 mb-6">
+          <Calculator className="mx-auto mb-3 text-zinc-700" size={28} />
+          <div className="font-display uppercase tracking-wide text-sm">No runs logged yet</div>
+          <div className="text-xs mt-1">Log a few runs, then come back here to predict a lifted run's true ET.</div>
         </div>
       ) : (
-        <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-5 text-center">
-          <div className="text-[10px] uppercase tracking-wide text-zinc-500 mb-1">Predicted 1/8 ET</div>
-          <div className="font-num text-4xl font-semibold text-amber-400 leading-none">
-            {predicted != null ? predicted.toFixed(3) : "—"}
+        <>
+          <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-4 mb-3">
+            <div className="text-[10px] uppercase tracking-wide text-zinc-500 mb-1.5">Race Day</div>
+            <select
+              value={effectivePredDate}
+              onChange={(e) => setPredDate(e.target.value)}
+              className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2 text-sm font-num text-zinc-100 focus:outline-none focus:border-amber-500"
+            >
+              {availableDates.map((d) => (
+                <option key={d} value={d}>
+                  {fmtDate(d)}
+                </option>
+              ))}
+            </select>
+
+            <div className="mt-4">
+              <div className="text-[10px] uppercase tracking-wide text-zinc-500 mb-1.5">330' Time</div>
+              <input
+                type="number"
+                inputMode="decimal"
+                value={predInput}
+                onChange={(e) => setPredInput(e.target.value)}
+                placeholder="e.g. 4.85"
+                className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2 text-sm font-num text-zinc-100 focus:outline-none focus:border-amber-500"
+              />
+            </div>
           </div>
-          <div className="text-[11px] text-zinc-500 mt-3">
-            Based on the average 330-1/8 segment ({predStats.avg.toFixed(3)}) across {predStats.count} non-lifted run
-            {predStats.count === 1 ? "" : "s"} that day.
+
+          {predStats.count === 0 ? (
+            <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-4 text-xs text-zinc-500">
+              No non-lifted runs logged on {fmtDate(effectivePredDate)} yet, so there's no clean 330-1/8 segment to
+              base a prediction on.
+            </div>
+          ) : (
+            <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-5 text-center">
+              <div className="text-[10px] uppercase tracking-wide text-zinc-500 mb-1">Predicted 1/8 ET</div>
+              <div className="font-num text-4xl font-semibold text-amber-400 leading-none">
+                {predicted != null ? predicted.toFixed(3) : "—"}
+              </div>
+              <div className="text-[11px] text-zinc-500 mt-3">
+                Based on the average 330-1/8 segment ({predStats.avg.toFixed(3)}) across {predStats.count} non-lifted
+                run
+                {predStats.count === 1 ? "" : "s"} that day.
+              </div>
+            </div>
+          )}
+
+          <div className="text-[10px] text-zinc-600 mt-4 mb-6 leading-relaxed">
+            This takes the 330' time you enter and adds the day's average clean (non-lifted) 330-1/8 segment,
+            combining both No Box and Box runs from that date — a quick way to estimate what a lifted run would have
+            gone if you'd stayed in it.
           </div>
-        </div>
+        </>
       )}
 
-      <div className="text-[10px] text-zinc-600 mt-4 leading-relaxed">
-        This takes the 330' time you enter and adds the day's average clean (non-lifted) 330-1/8 segment, combining
-        both No Box and Box runs from that date — a quick way to estimate what a lifted run would have gone if you'd
-        stayed in it.
+      <div className="border-t border-zinc-800 pt-5">
+        <div className="text-[11px] uppercase tracking-wide text-zinc-500 mb-2 font-display">Run Predictor</div>
+
+        <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-4 mb-3">
+          <div className="mb-3">
+            <div className="text-[10px] uppercase tracking-wide text-zinc-500 mb-1.5">Track *</div>
+            <TrackSelect tracks={tracks} value={predictTrack} onChange={setPredictTrack} onAddTrack={onAddTrack} />
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <div className="text-[10px] uppercase tracking-wide text-zinc-500 mb-1.5">Date</div>
+              <input
+                type="date"
+                value={predictDate}
+                onChange={(e) => setPredictDate(e.target.value)}
+                className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2 text-sm font-num text-zinc-100 focus:outline-none focus:border-amber-500"
+              />
+            </div>
+            <div>
+              <div className="text-[10px] uppercase tracking-wide text-zinc-500 mb-1.5">Time of Day</div>
+              <input
+                type="time"
+                value={predictTime}
+                onChange={(e) => setPredictTime(e.target.value)}
+                className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2 text-sm font-num text-zinc-100 focus:outline-none focus:border-amber-500"
+              />
+            </div>
+          </div>
+        </div>
+
+        {!predictTrack ? (
+          <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-4 text-xs text-zinc-500">
+            Pick a track to get a prediction.
+          </div>
+        ) : !runPrediction || runPrediction.value == null ? (
+          <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-4 text-xs text-zinc-500">
+            {runPrediction?.missing === "both"
+              ? `No runs recorded yet at ${predictTrack}.`
+              : runPrediction?.missing === "segment330"
+              ? `No non-lifted runs recorded yet at ${predictTrack} to source a clean 330-1/8 segment.`
+              : `Not enough 60-330 data recorded yet at ${predictTrack}.`}
+          </div>
+        ) : (
+          <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-5 text-center">
+            <div className="text-[10px] uppercase tracking-wide text-zinc-500 mb-1">Predicted 1/8 ET</div>
+            <div className="font-num text-4xl font-semibold text-amber-400 leading-none">
+              {runPrediction.value.toFixed(3)}
+            </div>
+            <div className="text-[11px] text-zinc-500 mt-3 space-y-0.5">
+              <div>
+                60-330 seg {fmt(runPrediction.seg60_330)} · {fmtDate(runPrediction.seg60_330Run.date)}{" "}
+                {fmtTime(runPrediction.seg60_330Run.time)}
+              </div>
+              <div>
+                330-1/8 seg {fmt(runPrediction.seg330_8th)} (full run) · {fmtDate(runPrediction.seg330_8thRun.date)}{" "}
+                {fmtTime(runPrediction.seg330_8thRun.time)}
+              </div>
+            </div>
+          </div>
+        )}
+
+        <div className="text-[10px] text-zinc-600 mt-4 leading-relaxed">
+          Finds the closest full (non-lifted) run at this track for a clean 330-1/8 segment, and separately the
+          closest run at this track (lifted or not) for the 60-330 segment, then adds them together. Never crosses
+          tracks. "Closest" means nearest calendar date first (ignoring year), using time of day only to break ties.
+        </div>
       </div>
     </div>
   );
