@@ -5,7 +5,7 @@ import {
   Thermometer, Droplets, Wind, Mountain, Calendar, MapPin,
   Flame, Settings2, Package, Layers, Zap, Wrench, TriangleAlert,
   Hand, Flag, Calculator, Eye, Download, Upload, RefreshCw, User,
-  Camera, Image as ImageIcon
+  Camera, Image as ImageIcon, CloudSun
 } from "lucide-react";
 
 const TYPE_LABELS = { nobox: "No Box", box: "Box", elliot: "Elliot" };
@@ -21,6 +21,8 @@ const RUNS_KEY = "novalog-runs";
 const COMPONENTS_KEY = "novalog-components";
 const TRACKS_KEY = "novalog-tracks";
 
+// Tracks carry an optional lat/lon (resolved via /api/geocode, on demand)
+// so weather lookups know where to query. null until resolved.
 const DEFAULT_TRACKS = [
   "Beacon Dragway",
   "Beech Bend Raceway Park",
@@ -29,7 +31,11 @@ const DEFAULT_TRACKS = [
   "Holly Springs Motorsports",
   "Montgomery Motorsports",
   "Music City Raceway",
-];
+].map((name) => ({ name, lat: null, lon: null }));
+
+const findTrack = (tracks, name) => tracks.find((t) => t.name === name) || null;
+
+const WEATHER_FIELDS = ["temp", "humidity", "waterGrains", "da"];
 
 const todayStr = () => new Date().toISOString().slice(0, 10);
 const nowTimeStr = () => {
@@ -325,10 +331,15 @@ export default function NovaRunTracker() {
       if (t && t.value) loadedTracks = JSON.parse(t.value);
     } catch (e) {}
     if (!loadedTracks || loadedTracks.length === 0) loadedTracks = DEFAULT_TRACKS;
+    // Migrate from the old plain-string track list to {name, lat, lon}.
+    const wasStringFormat = loadedTracks.some((t) => typeof t === "string");
+    loadedTracks = loadedTracks.map((t) => (typeof t === "string" ? { name: t, lat: null, lon: null } : t));
     // Self-heal: make sure any track name already used on a run is always
     // selectable, even if it predates the tracks list or came from an import.
-    const runTracks = Array.from(new Set(loadedRuns.map((r) => r.track).filter(Boolean)));
-    const mergedTracks = Array.from(new Set([...loadedTracks, ...runTracks])).sort((a, b) => a.localeCompare(b));
+    const knownNames = new Set(loadedTracks.map((t) => t.name));
+    const runTrackNames = Array.from(new Set(loadedRuns.map((r) => r.track).filter(Boolean)));
+    const newFromRuns = runTrackNames.filter((n) => !knownNames.has(n)).map((name) => ({ name, lat: null, lon: null }));
+    const mergedTracks = [...loadedTracks, ...newFromRuns].sort((a, b) => a.name.localeCompare(b.name));
 
     setRuns(loadedRuns);
     setComponents(loadedComponents);
@@ -336,7 +347,7 @@ export default function NovaRunTracker() {
     setLoaded(true);
     setSyncing(false);
 
-    if (mergedTracks.length !== loadedTracks.length) {
+    if (wasStringFormat || newFromRuns.length > 0) {
       persistTracks(mergedTracks);
     }
   };
@@ -375,13 +386,133 @@ export default function NovaRunTracker() {
     } catch (e) {}
   };
 
-  const addTrack = async (name) => {
+  const addTrack = async (name, lat = null, lon = null) => {
     const trimmed = name.trim();
     if (!trimmed) return "";
-    if (!tracks.includes(trimmed)) {
-      await persistTracks([...tracks, trimmed].sort((a, b) => a.localeCompare(b)));
+    if (!findTrack(tracks, trimmed)) {
+      await persistTracks([...tracks, { name: trimmed, lat, lon }].sort((a, b) => a.name.localeCompare(b.name)));
     }
     return trimmed;
+  };
+
+  // Saves resolved coordinates for a track (new or existing) so future
+  // weather lookups don't need to re-geocode it.
+  const setTrackLocation = async (name, lat, lon) => {
+    const next = findTrack(tracks, name)
+      ? tracks.map((t) => (t.name === name ? { ...t, lat, lon } : t))
+      : [...tracks, { name, lat, lon }].sort((a, b) => a.name.localeCompare(b.name));
+    await persistTracks(next);
+  };
+
+  // Resolves a place name (or city/state/zip) to {lat, lon, label} via the
+  // geocoding endpoint. Returns null on any failure so callers can fall back
+  // to prompting the user, rather than throwing.
+  const geocodeLocation = async (query) => {
+    try {
+      const res = await fetch("/api/geocode", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query }),
+      });
+      if (!res.ok) return null;
+      const data = await res.json();
+      if (typeof data.lat !== "number" || typeof data.lon !== "number") return null;
+      return data;
+    } catch {
+      return null;
+    }
+  };
+
+  const [backfillState, setBackfillState] = useState({ status: "idle", done: 0, total: 0, summary: null });
+
+  // Fills in blank weather fields on past runs from historical weather data.
+  // Groups by track+date so each unique day at a track costs one API call,
+  // reused across every run logged that day, and never touches a field the
+  // user already filled in.
+  const backfillWeather = async () => {
+    const isBlank = (v) => v === "" || v === null || v === undefined;
+    const needsAny = (r) => WEATHER_FIELDS.some((k) => isBlank(r[k]));
+
+    const groups = new Map();
+    for (const r of runs) {
+      if (!r.track || !r.date || !needsAny(r)) continue;
+      const key = `${r.track}__${r.date}`;
+      if (!groups.has(key)) groups.set(key, { track: r.track, date: r.date, runs: [] });
+      groups.get(key).runs.push(r);
+    }
+    const groupList = Array.from(groups.values());
+    if (groupList.length === 0) {
+      setBackfillState({ status: "done", done: 0, total: 0, summary: { updatedRuns: 0, skippedTracks: [] } });
+      return;
+    }
+
+    setBackfillState({ status: "running", done: 0, total: groupList.length, summary: null });
+
+    let workingTracks = tracks;
+    const updatesById = {};
+    const skippedTracks = new Set();
+    let updatedRuns = 0;
+
+    for (let i = 0; i < groupList.length; i++) {
+      const { track: trackName, date, runs: groupRuns } = groupList[i];
+      let trackObj = findTrack(workingTracks, trackName);
+      if (!trackObj || trackObj.lat == null || trackObj.lon == null) {
+        const geo = await geocodeLocation(trackName);
+        if (geo) {
+          trackObj = { name: trackName, lat: geo.lat, lon: geo.lon };
+          workingTracks = findTrack(workingTracks, trackName)
+            ? workingTracks.map((t) => (t.name === trackName ? trackObj : t))
+            : [...workingTracks, trackObj];
+          await setTrackLocation(trackName, geo.lat, geo.lon);
+        } else {
+          skippedTracks.add(trackName);
+          setBackfillState((s) => ({ ...s, done: i + 1 }));
+          continue;
+        }
+      }
+
+      try {
+        const res = await fetch("/api/weather", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            lat: trackObj.lat,
+            lon: trackObj.lon,
+            date,
+            times: groupRuns.map((r) => r.time || "12:00"),
+          }),
+        });
+        const data = await res.json().catch(() => null);
+        if (res.ok && data && Array.isArray(data.results)) {
+          groupRuns.forEach((r, idx) => {
+            const point = data.results[idx];
+            if (!point || point.error) return;
+            const fill = {};
+            WEATHER_FIELDS.forEach((k) => {
+              if (isBlank(r[k])) fill[k] = String(point[k]);
+            });
+            if (Object.keys(fill).length > 0) {
+              updatesById[r.id] = fill;
+              updatedRuns++;
+            }
+          });
+        }
+      } catch (e) {}
+
+      setBackfillState((s) => ({ ...s, done: i + 1 }));
+    }
+
+    if (Object.keys(updatesById).length > 0) {
+      const nextRuns = runs.map((r) => (updatesById[r.id] ? { ...r, ...updatesById[r.id] } : r));
+      await persistRuns(nextRuns);
+    }
+
+    setBackfillState({
+      status: "done",
+      done: groupList.length,
+      total: groupList.length,
+      summary: { updatedRuns, skippedTracks: Array.from(skippedTracks) },
+    });
   };
 
   const lastTrack = useMemo(() => {
@@ -728,6 +859,8 @@ export default function NovaRunTracker() {
             exportCSV={exportCSV}
             fileInputRef={fileInputRef}
             importError={importError}
+            backfillState={backfillState}
+            onBackfillWeather={backfillWeather}
           />
         ) : tab === "predict" ? (
           <PredictionPanel
@@ -740,6 +873,8 @@ export default function NovaRunTracker() {
             predicted={predicted}
             tracks={tracks}
             onAddTrack={addTrack}
+            onGeocode={geocodeLocation}
+            onSetLocation={setTrackLocation}
             predictTrack={predictTrack}
             setPredictTrack={setPredictTrack}
             predictDate={predictDate}
@@ -877,6 +1012,8 @@ export default function NovaRunTracker() {
           setBigText={setBigText}
           tracks={tracks}
           onAddTrack={addTrack}
+          onGeocode={geocodeLocation}
+          onSetLocation={setTrackLocation}
         />
       )}
     </div>
@@ -1073,11 +1210,13 @@ function Field({ label, value, onChange, type = "text", placeholder }) {
 
 // Shared track dropdown used everywhere a track is picked. Lets the user add
 // a brand new track inline, which persists it to the shared track list.
-function TrackSelect({ tracks, value, onChange, onAddTrack }) {
+function TrackSelect({ tracks, value, onChange, onAddTrack, onGeocode, onSetLocation }) {
   const [adding, setAdding] = useState(false);
   const [newName, setNewName] = useState("");
+  const [locating, setLocating] = useState(null); // track name currently being located, or null
 
-  const options = value && !tracks.includes(value) ? [value, ...tracks] : tracks;
+  const names = tracks.map((t) => t.name);
+  const options = value && !names.includes(value) ? [value, ...names] : names;
 
   const confirmAdd = async () => {
     const trimmed = newName.trim();
@@ -1086,7 +1225,22 @@ function TrackSelect({ tracks, value, onChange, onAddTrack }) {
     if (!trimmed) return;
     await onAddTrack(trimmed);
     onChange(trimmed);
+    setLocating(trimmed);
   };
+
+  if (locating) {
+    return (
+      <TrackLocationPrompt
+        trackName={locating}
+        onGeocode={onGeocode}
+        onResolved={async (lat, lon) => {
+          await onSetLocation(locating, lat, lon);
+          setLocating(null);
+        }}
+        onSkip={() => setLocating(null)}
+      />
+    );
+  }
 
   if (adding) {
     return (
@@ -1144,9 +1298,112 @@ function TrackSelect({ tracks, value, onChange, onAddTrack }) {
   );
 }
 
+// Resolves a track name to lat/lon: tries the track name itself first, and
+// if that fails (common for niche venue names) falls back to asking for a
+// nearby city, state, or zip. Shared between "add new track" and "Get
+// Weather" whenever a track is missing coordinates.
+function TrackLocationPrompt({ trackName, onGeocode, onResolved, onSkip }) {
+  const [status, setStatus] = useState("loading"); // loading | confirm | manual
+  const [result, setResult] = useState(null);
+  const [manualQuery, setManualQuery] = useState("");
+  const [manualError, setManualError] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+    onGeocode(trackName)
+      .then((r) => {
+        if (cancelled) return;
+        if (r) {
+          setResult(r);
+          setStatus("confirm");
+        } else {
+          setStatus("manual");
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setStatus("manual");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [trackName]);
+
+  const tryManual = async () => {
+    const q = manualQuery.trim();
+    if (!q) return;
+    setManualError("");
+    setStatus("loading");
+    const r = await onGeocode(q).catch(() => null);
+    if (r) {
+      setResult(r);
+      setStatus("confirm");
+    } else {
+      setManualError(`Couldn't find "${q}". Try a nearby city, state, or zip.`);
+      setStatus("manual");
+    }
+  };
+
+  if (status === "loading") {
+    return (
+      <div className="flex items-center gap-1.5 text-[11px] text-zinc-500 py-1">
+        <RefreshCw size={11} className="animate-spin" />
+        Locating {trackName}…
+      </div>
+    );
+  }
+
+  if (status === "confirm") {
+    return (
+      <div className="bg-zinc-900 border border-zinc-800 rounded-lg p-3 text-xs">
+        <div className="text-zinc-400 mb-2">
+          Found: <span className="text-zinc-100">{result.label}</span> — use this for weather at {trackName}?
+        </div>
+        <div className="flex gap-2">
+          <button
+            type="button"
+            onClick={() => onResolved(result.lat, result.lon)}
+            className="flex-1 py-1.5 rounded-lg bg-amber-400 text-zinc-950 font-medium"
+          >
+            Use this
+          </button>
+          <button
+            type="button"
+            onClick={() => setStatus("manual")}
+            className="flex-1 py-1.5 rounded-lg bg-zinc-800 text-zinc-300 font-medium"
+          >
+            Try a different location
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="bg-zinc-900 border border-zinc-800 rounded-lg p-3 text-xs">
+      <div className="text-zinc-400 mb-2">Couldn't automatically find "{trackName}". Enter a nearby city, state, or zip:</div>
+      <div className="flex gap-2">
+        <input
+          autoFocus
+          value={manualQuery}
+          onChange={(e) => setManualQuery(e.target.value)}
+          placeholder="e.g. Bristol, TN or 37620"
+          className="flex-1 bg-zinc-950 border border-zinc-800 rounded-lg px-2 py-1.5 text-xs text-zinc-100 focus:outline-none focus:border-amber-500"
+        />
+        <button type="button" onClick={tryManual} className="px-3 py-1.5 rounded-lg bg-amber-400 text-zinc-950 font-medium">
+          Find
+        </button>
+      </div>
+      {manualError && <div className="text-red-400 mt-1.5">{manualError}</div>}
+      <button type="button" onClick={onSkip} className="text-zinc-500 mt-2 underline">
+        Skip for now
+      </button>
+    </div>
+  );
+}
+
 const SCAN_FIELDS = ["dialIn", "rt", "sixty", "threeThirty", "eighth", "mph"];
 
-function RunSheet({ form, setForm, onSave, onClose, bigText, setBigText, tracks, onAddTrack }) {
+function RunSheet({ form, setForm, onSave, onClose, bigText, setBigText, tracks, onAddTrack, onGeocode, onSetLocation }) {
   const set = (key) => (val) => setForm({ ...form, [key]: val });
 
   const [scanning, setScanning] = useState(false);
@@ -1200,6 +1457,48 @@ function RunSheet({ form, setForm, onSave, onClose, bigText, setBigText, tracks,
     }
   };
 
+  const [weatherStatus, setWeatherStatus] = useState("idle"); // idle | needsLocation | loading | error
+  const [weatherError, setWeatherError] = useState("");
+
+  const fetchWeatherFor = async (lat, lon) => {
+    setWeatherStatus("loading");
+    setWeatherError("");
+    try {
+      const res = await fetch("/api/weather", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ lat, lon, date: form.date, time: form.time }),
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok) throw new Error((data && data.error) || "Couldn't fetch weather.");
+      setForm((f) => ({
+        ...f,
+        temp: String(data.temp),
+        humidity: String(data.humidity),
+        waterGrains: String(data.waterGrains),
+        da: String(data.da),
+      }));
+      setWeatherStatus("idle");
+    } catch (err) {
+      setWeatherStatus("error");
+      setWeatherError(err.message || "Couldn't fetch weather.");
+    }
+  };
+
+  const handleGetWeather = () => {
+    if (!form.track) {
+      setWeatherStatus("error");
+      setWeatherError("Pick a track first.");
+      return;
+    }
+    const track = findTrack(tracks, form.track);
+    if (track && track.lat != null && track.lon != null) {
+      fetchWeatherFor(track.lat, track.lon);
+    } else {
+      setWeatherStatus("needsLocation");
+    }
+  };
+
   return (
     <div className="fixed inset-0 z-40 bg-black/70 flex items-end">
       <div className="bg-zinc-950 border-t border-zinc-800 rounded-t-2xl w-full p-5 overflow-y-auto" style={{ maxHeight: "92vh" }}>
@@ -1243,7 +1542,14 @@ function RunSheet({ form, setForm, onSave, onClose, bigText, setBigText, tracks,
         </div>
         <div className="mb-3">
           <div className="text-[10px] uppercase tracking-wide text-zinc-500 mb-1">Track</div>
-          <TrackSelect tracks={tracks} value={form.track} onChange={set("track")} onAddTrack={onAddTrack} />
+          <TrackSelect
+            tracks={tracks}
+            value={form.track}
+            onChange={set("track")}
+            onAddTrack={onAddTrack}
+            onGeocode={onGeocode}
+            onSetLocation={onSetLocation}
+          />
         </div>
 
         <div className="mb-3">
@@ -1380,7 +1686,32 @@ function RunSheet({ form, setForm, onSave, onClose, bigText, setBigText, tracks,
           </div>
         </div>
 
-        <div className="text-[11px] uppercase tracking-wide text-zinc-600 mt-4 mb-2">Weather (optional)</div>
+        <div className="flex items-center justify-between mt-4 mb-2">
+          <div className="text-[11px] uppercase tracking-wide text-zinc-600">Weather (optional)</div>
+          <button
+            type="button"
+            onClick={handleGetWeather}
+            disabled={weatherStatus === "loading"}
+            className="flex items-center gap-1 text-[10px] font-display uppercase tracking-wide px-2.5 py-1 rounded-full bg-zinc-900 border border-zinc-800 text-zinc-300 disabled:opacity-50"
+          >
+            <CloudSun size={12} className={weatherStatus === "loading" ? "animate-pulse" : ""} />
+            {weatherStatus === "loading" ? "Getting Weather…" : "Get Weather"}
+          </button>
+        </div>
+        {weatherStatus === "needsLocation" && (
+          <div className="mb-3">
+            <TrackLocationPrompt
+              trackName={form.track}
+              onGeocode={onGeocode}
+              onResolved={async (lat, lon) => {
+                await onSetLocation(form.track, lat, lon);
+                fetchWeatherFor(lat, lon);
+              }}
+              onSkip={() => setWeatherStatus("idle")}
+            />
+          </div>
+        )}
+        {weatherStatus === "error" && <div className="text-[11px] text-red-400 mb-2">{weatherError}</div>}
         <div className="grid grid-cols-2 gap-3 mb-3">
           <Field label="Temp (°F)" type="number" value={form.temp} onChange={set("temp")} />
           <Field label="Humidity (%)" type="number" value={form.humidity} onChange={set("humidity")} />
@@ -1426,6 +1757,8 @@ function PredictionPanel({
   predicted,
   tracks,
   onAddTrack,
+  onGeocode,
+  onSetLocation,
   predictTrack,
   setPredictTrack,
   predictDate,
@@ -1506,7 +1839,14 @@ function PredictionPanel({
         <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-4 mb-3">
           <div className="mb-3">
             <div className="text-[10px] uppercase tracking-wide text-zinc-500 mb-1.5">Track *</div>
-            <TrackSelect tracks={tracks} value={predictTrack} onChange={setPredictTrack} onAddTrack={onAddTrack} />
+            <TrackSelect
+              tracks={tracks}
+              value={predictTrack}
+              onChange={setPredictTrack}
+              onAddTrack={onAddTrack}
+              onGeocode={onGeocode}
+              onSetLocation={onSetLocation}
+            />
           </div>
           <div className="grid grid-cols-2 gap-3">
             <div>
@@ -1591,6 +1931,8 @@ function SetupPanel({
   exportCSV,
   fileInputRef,
   importError,
+  backfillState,
+  onBackfillWeather,
 }) {
   return (
     <div>
@@ -1620,6 +1962,42 @@ function SetupPanel({
         <div className="text-[10px] text-zinc-600 mt-2 leading-relaxed">
           The .json backup restores everything exactly (runs, components, history). The .csv is for opening in Excel or
           Sheets — handy for analysis, but it can't be re-imported.
+        </div>
+      </div>
+
+      <div className="text-[11px] uppercase tracking-wide text-zinc-600 mb-2">Weather Backfill</div>
+      <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-4 mb-5">
+        <button
+          onClick={onBackfillWeather}
+          disabled={backfillState.status === "running"}
+          className="w-full flex items-center justify-center gap-1.5 py-2 rounded-lg bg-zinc-800 text-zinc-200 text-xs font-medium disabled:opacity-50"
+        >
+          <CloudSun size={13} className={backfillState.status === "running" ? "animate-pulse" : ""} />
+          {backfillState.status === "running"
+            ? `Backfilling ${backfillState.done}/${backfillState.total}…`
+            : "Backfill Weather for Past Runs"}
+        </button>
+        {backfillState.status === "done" && backfillState.summary && (
+          <div className="text-[11px] text-zinc-400 mt-2">
+            {backfillState.summary.updatedRuns === 0 && backfillState.summary.skippedTracks.length === 0
+              ? "Nothing to backfill — every run already has weather data or is missing a track."
+              : backfillState.summary.updatedRuns > 0
+              ? `Filled in weather for ${backfillState.summary.updatedRuns} run${
+                  backfillState.summary.updatedRuns === 1 ? "" : "s"
+                }.`
+              : null}
+            {backfillState.summary.skippedTracks.length > 0 && (
+              <div className="text-amber-400 mt-1">
+                Couldn't locate: {backfillState.summary.skippedTracks.join(", ")}. Open Log Run, pick that track, and
+                hit Get Weather once to resolve it manually, then run this again.
+              </div>
+            )}
+          </div>
+        )}
+        <div className="text-[10px] text-zinc-600 mt-2 leading-relaxed">
+          Only fills in Temp/Humidity/Water Grains/DA where they're currently blank — never overwrites anything you
+          entered. Uses modeled historical weather data (not an on-site instrument reading), grouped by track and day
+          so it doesn't hammer the weather API.
         </div>
       </div>
 
