@@ -610,42 +610,23 @@ export default function NovaRunTracker() {
     return { value: threeThirty + seg330_8th, threeThirty, threeThirtyRun, seg330_8th, seg330_8thRun };
   }, [runs, predictTrack, predictDate, predictTime]);
 
+  const [daTableTrack, setDaTableTrack] = useState("");
+
   // DA reference table: 200ft ranges from the lowest recorded DA to the
-  // highest — a row labeled 3200 covers [3200, 3400). Each row averages the
-  // 60-330 segment for runs in that range (any lifted status — the 60-330
-  // phase isn't affected by a later lift), and shows the low/high full 1/8
-  // ET. A full run's own ET is used directly; a lifted run's ET is
-  // estimated the same way Run Predictor does (its actual 330' time + the
-  // 330-1/8 segment of a full run), but scoped strictly to a full run from
-  // that exact same track and same day.
+  // highest — a row labeled 3200 covers [3200, 3400). 60-330 segment
+  // averages every run at that DA (lifted or not — a lift always happens
+  // after 330', so that phase is never affected). 1/8 ET uses true full
+  // (non-lifted) runs only, no estimated/predicted numbers. Optionally
+  // filtered to one track.
   const daTable = useMemo(() => {
     const DA_STEP = 200;
-    const withDa = runs
+    const trackRuns = runs.filter((r) => !daTableTrack || r.track === daTableTrack);
+    const withDa = trackRuns
       .map((r) => ({ r, da: parseFloat(r.da) }))
       .filter((x) => !isNaN(x.da));
     if (withDa.length === 0) return null;
 
     const bucketOf = (da) => Math.floor(da / DA_STEP) * DA_STEP;
-
-    // Same-track/same-day average 330-1/8 segment from full runs, used to
-    // estimate a lifted run's ET when it's the only data point at its DA.
-    const fullSegByTrackDate = new Map();
-    for (const r of runs) {
-      if (r.lifted) continue;
-      const seg = computeSegments(r).seg330_8th;
-      if (seg == null) continue;
-      const key = `${r.track}__${r.date}`;
-      if (!fullSegByTrackDate.has(key)) fullSegByTrackDate.set(key, []);
-      fullSegByTrackDate.get(key).push(seg);
-    }
-    const estimateLiftedET = (r) => {
-      const threeThirty = parseFloat(r.threeThirty);
-      if (isNaN(threeThirty)) return null;
-      const segs = fullSegByTrackDate.get(`${r.track}__${r.date}`);
-      if (!segs || segs.length === 0) return null;
-      const avgSeg = segs.reduce((a, b) => a + b, 0) / segs.length;
-      return threeThirty + avgSeg;
-    };
 
     const buckets = new Map();
     let minDa = Infinity;
@@ -667,16 +648,10 @@ export default function NovaRunTracker() {
       const segs = bucketRuns.map((r) => computeSegments(r).seg60_330).filter((v) => v != null && !isNaN(v));
       const avgSeg60_330 = segs.length ? segs.reduce((a, b) => a + b, 0) / segs.length : null;
 
-      const ets = [];
-      bucketRuns.forEach((r) => {
-        if (!r.lifted) {
-          const et = parseFloat(r.eighth);
-          if (!isNaN(et)) ets.push(et);
-        } else {
-          const est = estimateLiftedET(r);
-          if (est != null) ets.push(est);
-        }
-      });
+      const ets = bucketRuns
+        .filter((r) => !r.lifted)
+        .map((r) => parseFloat(r.eighth))
+        .filter((v) => !isNaN(v));
       const etLow = ets.length ? Math.min(...ets) : null;
       const etHigh = ets.length ? Math.max(...ets) : null;
 
@@ -684,7 +659,7 @@ export default function NovaRunTracker() {
     }
 
     return rows;
-  }, [runs]);
+  }, [runs, daTableTrack]);
 
   const serviceLog = useMemo(() => {
     return runs
@@ -863,6 +838,8 @@ export default function NovaRunTracker() {
             setPredictTime={setPredictTime}
             runPrediction={runPrediction}
             daTable={daTable}
+            daTableTrack={daTableTrack}
+            setDaTableTrack={setDaTableTrack}
           />
         ) : visibleRuns.length === 0 ? (
           <div className="text-center py-16 text-zinc-500">
@@ -1748,6 +1725,8 @@ function PredictionPanel({
   setPredictTime,
   runPrediction,
   daTable,
+  daTableTrack,
+  setDaTableTrack,
 }) {
   return (
     <div>
@@ -1893,9 +1872,22 @@ function PredictionPanel({
 
       <div className="border-t border-zinc-800 pt-5 mt-5">
         <div className="text-[11px] uppercase tracking-wide text-zinc-500 mb-2 font-display">Density Altitude Reference</div>
+        <select
+          value={daTableTrack}
+          onChange={(e) => setDaTableTrack(e.target.value)}
+          className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2 text-sm font-num text-zinc-100 focus:outline-none focus:border-amber-500 mb-3"
+        >
+          <option value="">All Tracks</option>
+          {tracks.map((t) => (
+            <option key={t.name} value={t.name}>
+              {t.name}
+            </option>
+          ))}
+        </select>
         {!daTable ? (
           <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-4 text-xs text-zinc-500">
-            No runs with weather data yet — log a run with DA filled in (or use Get Weather) to build this table.
+            No runs with DA recorded yet{daTableTrack ? ` at ${daTableTrack}` : ""} — log one, or use Get Weather, to
+            build this table.
           </div>
         ) : (
           <div className="bg-zinc-900 border border-zinc-800 rounded-2xl overflow-hidden">
@@ -1926,10 +1918,9 @@ function PredictionPanel({
           </div>
         )}
         <div className="text-[10px] text-zinc-600 mt-4 leading-relaxed">
-          Every 200ft from your lowest to highest recorded Density Altitude, highest at top. 60-330 segment averages
-          any run at that DA (lifted or not — lifting doesn't affect that phase). 1/8 ET uses actual full-run ETs; a
-          lifted run only fills in when there's a full run at the same track and same day to estimate it from, using
-          the same math as Run Predictor above.
+          Every 200ft from your lowest to highest recorded Density Altitude for the selected track, highest at top.
+          60-330 averages any run at that DA (lifted or not — a lift always happens after 330'). 1/8 ET uses true full
+          (non-lifted) runs only — no estimated or predicted numbers.
         </div>
       </div>
     </div>
