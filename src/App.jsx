@@ -35,8 +35,6 @@ const DEFAULT_TRACKS = [
 
 const findTrack = (tracks, name) => tracks.find((t) => t.name === name) || null;
 
-const WEATHER_FIELDS = ["temp", "humidity", "waterGrains", "da"];
-
 const todayStr = () => new Date().toISOString().slice(0, 10);
 const nowTimeStr = () => {
   const d = new Date();
@@ -423,98 +421,6 @@ export default function NovaRunTracker() {
     }
   };
 
-  const [backfillState, setBackfillState] = useState({ status: "idle", done: 0, total: 0, summary: null });
-
-  // Fills in blank weather fields on past runs from historical weather data.
-  // Groups by track+date so each unique day at a track costs one API call,
-  // reused across every run logged that day, and never touches a field the
-  // user already filled in.
-  const backfillWeather = async () => {
-    const isBlank = (v) => v === "" || v === null || v === undefined;
-    const needsAny = (r) => WEATHER_FIELDS.some((k) => isBlank(r[k]));
-
-    const groups = new Map();
-    for (const r of runs) {
-      if (!r.track || !r.date || !needsAny(r)) continue;
-      const key = `${r.track}__${r.date}`;
-      if (!groups.has(key)) groups.set(key, { track: r.track, date: r.date, runs: [] });
-      groups.get(key).runs.push(r);
-    }
-    const groupList = Array.from(groups.values());
-    if (groupList.length === 0) {
-      setBackfillState({ status: "done", done: 0, total: 0, summary: { updatedRuns: 0, skippedTracks: [] } });
-      return;
-    }
-
-    setBackfillState({ status: "running", done: 0, total: groupList.length, summary: null });
-
-    let workingTracks = tracks;
-    const updatesById = {};
-    const skippedTracks = new Set();
-    let updatedRuns = 0;
-
-    for (let i = 0; i < groupList.length; i++) {
-      const { track: trackName, date, runs: groupRuns } = groupList[i];
-      let trackObj = findTrack(workingTracks, trackName);
-      if (!trackObj || trackObj.lat == null || trackObj.lon == null) {
-        const geo = await geocodeLocation(trackName);
-        if (geo) {
-          trackObj = { name: trackName, lat: geo.lat, lon: geo.lon };
-          workingTracks = findTrack(workingTracks, trackName)
-            ? workingTracks.map((t) => (t.name === trackName ? trackObj : t))
-            : [...workingTracks, trackObj];
-          await setTrackLocation(trackName, geo.lat, geo.lon);
-        } else {
-          skippedTracks.add(trackName);
-          setBackfillState((s) => ({ ...s, done: i + 1 }));
-          continue;
-        }
-      }
-
-      try {
-        const res = await fetch("/api/weather", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            lat: trackObj.lat,
-            lon: trackObj.lon,
-            date,
-            times: groupRuns.map((r) => r.time || "12:00"),
-          }),
-        });
-        const data = await res.json().catch(() => null);
-        if (res.ok && data && Array.isArray(data.results)) {
-          groupRuns.forEach((r, idx) => {
-            const point = data.results[idx];
-            if (!point || point.error) return;
-            const fill = {};
-            WEATHER_FIELDS.forEach((k) => {
-              if (isBlank(r[k])) fill[k] = String(point[k]);
-            });
-            if (Object.keys(fill).length > 0) {
-              updatesById[r.id] = fill;
-              updatedRuns++;
-            }
-          });
-        }
-      } catch (e) {}
-
-      setBackfillState((s) => ({ ...s, done: i + 1 }));
-    }
-
-    if (Object.keys(updatesById).length > 0) {
-      const nextRuns = runs.map((r) => (updatesById[r.id] ? { ...r, ...updatesById[r.id] } : r));
-      await persistRuns(nextRuns);
-    }
-
-    setBackfillState({
-      status: "done",
-      done: groupList.length,
-      total: groupList.length,
-      summary: { updatedRuns, skippedTracks: Array.from(skippedTracks) },
-    });
-  };
-
   const lastTrack = useMemo(() => {
     if (runs.length === 0) return "";
     const latest = runs.reduce((best, r) => ((r.createdAt || 0) > (best.createdAt || 0) ? r : best), runs[0]);
@@ -704,6 +610,82 @@ export default function NovaRunTracker() {
     return { value: threeThirty + seg330_8th, threeThirty, threeThirtyRun, seg330_8th, seg330_8thRun };
   }, [runs, predictTrack, predictDate, predictTime]);
 
+  // DA reference table: 200ft ranges from the lowest recorded DA to the
+  // highest — a row labeled 3200 covers [3200, 3400). Each row averages the
+  // 60-330 segment for runs in that range (any lifted status — the 60-330
+  // phase isn't affected by a later lift), and shows the low/high full 1/8
+  // ET. A full run's own ET is used directly; a lifted run's ET is
+  // estimated the same way Run Predictor does (its actual 330' time + the
+  // 330-1/8 segment of a full run), but scoped strictly to a full run from
+  // that exact same track and same day.
+  const daTable = useMemo(() => {
+    const DA_STEP = 200;
+    const withDa = runs
+      .map((r) => ({ r, da: parseFloat(r.da) }))
+      .filter((x) => !isNaN(x.da));
+    if (withDa.length === 0) return null;
+
+    const bucketOf = (da) => Math.floor(da / DA_STEP) * DA_STEP;
+
+    // Same-track/same-day average 330-1/8 segment from full runs, used to
+    // estimate a lifted run's ET when it's the only data point at its DA.
+    const fullSegByTrackDate = new Map();
+    for (const r of runs) {
+      if (r.lifted) continue;
+      const seg = computeSegments(r).seg330_8th;
+      if (seg == null) continue;
+      const key = `${r.track}__${r.date}`;
+      if (!fullSegByTrackDate.has(key)) fullSegByTrackDate.set(key, []);
+      fullSegByTrackDate.get(key).push(seg);
+    }
+    const estimateLiftedET = (r) => {
+      const threeThirty = parseFloat(r.threeThirty);
+      if (isNaN(threeThirty)) return null;
+      const segs = fullSegByTrackDate.get(`${r.track}__${r.date}`);
+      if (!segs || segs.length === 0) return null;
+      const avgSeg = segs.reduce((a, b) => a + b, 0) / segs.length;
+      return threeThirty + avgSeg;
+    };
+
+    const buckets = new Map();
+    let minDa = Infinity;
+    let maxDa = -Infinity;
+    for (const { r, da } of withDa) {
+      minDa = Math.min(minDa, da);
+      maxDa = Math.max(maxDa, da);
+      const key = bucketOf(da);
+      if (!buckets.has(key)) buckets.set(key, []);
+      buckets.get(key).push(r);
+    }
+
+    const minBucket = bucketOf(minDa);
+    const maxBucket = bucketOf(maxDa);
+
+    const rows = [];
+    for (let da = maxBucket; da >= minBucket; da -= DA_STEP) {
+      const bucketRuns = buckets.get(da) || [];
+      const segs = bucketRuns.map((r) => computeSegments(r).seg60_330).filter((v) => v != null && !isNaN(v));
+      const avgSeg60_330 = segs.length ? segs.reduce((a, b) => a + b, 0) / segs.length : null;
+
+      const ets = [];
+      bucketRuns.forEach((r) => {
+        if (!r.lifted) {
+          const et = parseFloat(r.eighth);
+          if (!isNaN(et)) ets.push(et);
+        } else {
+          const est = estimateLiftedET(r);
+          if (est != null) ets.push(est);
+        }
+      });
+      const etLow = ets.length ? Math.min(...ets) : null;
+      const etHigh = ets.length ? Math.max(...ets) : null;
+
+      rows.push({ da, avgSeg60_330, etLow, etHigh, count: bucketRuns.length });
+    }
+
+    return rows;
+  }, [runs]);
+
   const serviceLog = useMemo(() => {
     return runs
       .filter((r) => r.serviceNote && r.serviceNote.trim())
@@ -859,8 +841,6 @@ export default function NovaRunTracker() {
             exportCSV={exportCSV}
             fileInputRef={fileInputRef}
             importError={importError}
-            backfillState={backfillState}
-            onBackfillWeather={backfillWeather}
           />
         ) : tab === "predict" ? (
           <PredictionPanel
@@ -882,6 +862,7 @@ export default function NovaRunTracker() {
             predictTime={predictTime}
             setPredictTime={setPredictTime}
             runPrediction={runPrediction}
+            daTable={daTable}
           />
         ) : visibleRuns.length === 0 ? (
           <div className="text-center py-16 text-zinc-500">
@@ -1766,6 +1747,7 @@ function PredictionPanel({
   predictTime,
   setPredictTime,
   runPrediction,
+  daTable,
 }) {
   return (
     <div>
@@ -1908,6 +1890,48 @@ function PredictionPanel({
           tracks. "Closest" means nearest calendar date first (ignoring year), using time of day only to break ties.
         </div>
       </div>
+
+      <div className="border-t border-zinc-800 pt-5 mt-5">
+        <div className="text-[11px] uppercase tracking-wide text-zinc-500 mb-2 font-display">Density Altitude Reference</div>
+        {!daTable ? (
+          <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-4 text-xs text-zinc-500">
+            No runs with weather data yet — log a run with DA filled in (or use Get Weather) to build this table.
+          </div>
+        ) : (
+          <div className="bg-zinc-900 border border-zinc-800 rounded-2xl overflow-hidden">
+            <div className="grid grid-cols-3 gap-2 px-3 py-2 bg-zinc-950 text-[9px] uppercase tracking-wide text-zinc-500">
+              <div>Density Alt</div>
+              <div className="text-center">Avg 60-330</div>
+              <div className="text-right">1/8 ET Low-High</div>
+            </div>
+            <div className="divide-y divide-zinc-800">
+              {daTable.map((row) => (
+                <div key={row.da} className="grid grid-cols-3 gap-2 px-3 py-2 text-xs items-center">
+                  <div className="font-num text-zinc-200">
+                    {row.da.toLocaleString()}–{(row.da + 200).toLocaleString()} ft
+                  </div>
+                  <div className="font-num text-center text-amber-400">
+                    {row.avgSeg60_330 != null ? row.avgSeg60_330.toFixed(3) : "—"}
+                  </div>
+                  <div className="font-num text-right text-zinc-100">
+                    {row.etLow != null && row.etHigh != null
+                      ? row.etLow === row.etHigh
+                        ? row.etLow.toFixed(3)
+                        : `${row.etLow.toFixed(3)} – ${row.etHigh.toFixed(3)}`
+                      : "—"}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+        <div className="text-[10px] text-zinc-600 mt-4 leading-relaxed">
+          Every 200ft from your lowest to highest recorded Density Altitude, highest at top. 60-330 segment averages
+          any run at that DA (lifted or not — lifting doesn't affect that phase). 1/8 ET uses actual full-run ETs; a
+          lifted run only fills in when there's a full run at the same track and same day to estimate it from, using
+          the same math as Run Predictor above.
+        </div>
+      </div>
     </div>
   );
 }
@@ -1931,8 +1955,6 @@ function SetupPanel({
   exportCSV,
   fileInputRef,
   importError,
-  backfillState,
-  onBackfillWeather,
 }) {
   return (
     <div>
@@ -1962,42 +1984,6 @@ function SetupPanel({
         <div className="text-[10px] text-zinc-600 mt-2 leading-relaxed">
           The .json backup restores everything exactly (runs, components, history). The .csv is for opening in Excel or
           Sheets — handy for analysis, but it can't be re-imported.
-        </div>
-      </div>
-
-      <div className="text-[11px] uppercase tracking-wide text-zinc-600 mb-2">Weather Backfill</div>
-      <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-4 mb-5">
-        <button
-          onClick={onBackfillWeather}
-          disabled={backfillState.status === "running"}
-          className="w-full flex items-center justify-center gap-1.5 py-2 rounded-lg bg-zinc-800 text-zinc-200 text-xs font-medium disabled:opacity-50"
-        >
-          <CloudSun size={13} className={backfillState.status === "running" ? "animate-pulse" : ""} />
-          {backfillState.status === "running"
-            ? `Backfilling ${backfillState.done}/${backfillState.total}…`
-            : "Backfill Weather for Past Runs"}
-        </button>
-        {backfillState.status === "done" && backfillState.summary && (
-          <div className="text-[11px] text-zinc-400 mt-2">
-            {backfillState.summary.updatedRuns === 0 && backfillState.summary.skippedTracks.length === 0
-              ? "Nothing to backfill — every run already has weather data or is missing a track."
-              : backfillState.summary.updatedRuns > 0
-              ? `Filled in weather for ${backfillState.summary.updatedRuns} run${
-                  backfillState.summary.updatedRuns === 1 ? "" : "s"
-                }.`
-              : null}
-            {backfillState.summary.skippedTracks.length > 0 && (
-              <div className="text-amber-400 mt-1">
-                Couldn't locate: {backfillState.summary.skippedTracks.join(", ")}. Open Log Run, pick that track, and
-                hit Get Weather once to resolve it manually, then run this again.
-              </div>
-            )}
-          </div>
-        )}
-        <div className="text-[10px] text-zinc-600 mt-2 leading-relaxed">
-          Only fills in Temp/Humidity/Water Grains/DA where they're currently blank — never overwrites anything you
-          entered. Uses modeled historical weather data (not an on-site instrument reading), grouped by track and day
-          so it doesn't hammer the weather API.
         </div>
       </div>
 

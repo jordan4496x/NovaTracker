@@ -12,7 +12,7 @@ export default async function handler(req, res) {
     return;
   }
 
-  const { lat, lon, date, time, times } = req.body || {};
+  const { lat, lon, date, time } = req.body || {};
   if (typeof lat !== "number" || typeof lon !== "number" || !date) {
     res.status(400).json({ error: "Missing location or date." });
     return;
@@ -27,17 +27,6 @@ export default async function handler(req, res) {
     }
     if (!data) {
       res.status(502).json({ error: "Weather service has no data for that date/location." });
-      return;
-    }
-
-    // Batch mode: one Open-Meteo call reused for every requested time that
-    // day (used by the backfill job so it doesn't hit the API once per run).
-    if (Array.isArray(times)) {
-      const results = times.map((t) => {
-        const point = pointAt(data, date, t);
-        return point ? { time: t, ...point, source } : { time: t, error: "No data for that hour." };
-      });
-      res.status(200).json({ results, source });
       return;
     }
 
