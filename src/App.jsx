@@ -1513,7 +1513,7 @@ function RunSheet({ form, setForm, onSave, onClose, bigText, setBigText, tracks,
         <div className="mb-3">
           <div className="text-[10px] uppercase tracking-wide text-zinc-500 mb-1.5">Lane</div>
           <div className="flex gap-2 mb-2">
-            {["R", "L"].map((laneKey) => (
+            {["L", "R"].map((laneKey) => (
               <button
                 key={laneKey}
                 type="button"
