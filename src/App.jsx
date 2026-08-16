@@ -35,7 +35,12 @@ const DEFAULT_TRACKS = [
 
 const findTrack = (tracks, name) => tracks.find((t) => t.name === name) || null;
 
-const todayStr = () => new Date().toISOString().slice(0, 10);
+// Local calendar date, not UTC — toISOString() would show tomorrow's date
+// in the evening for anyone west of UTC (e.g. 9pm CDT is already 2am UTC).
+const todayStr = () => {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+};
 const nowTimeStr = () => {
   const d = new Date();
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
@@ -109,6 +114,20 @@ const findClosestRun = (candidates, targetDate, targetTime) => {
 const fmt = (v, d = 3) => {
   if (v === "" || v === null || v === undefined || isNaN(v)) return "—";
   return Number(v).toFixed(d);
+};
+
+// For raw, directly-entered values only (RT, 60', 330', 1/8 ET, MPH,
+// Dial-In, Delay) — truncates to d decimals instead of rounding, so a
+// 4-decimal timing-system reading shows its actual 3rd digit rather than a
+// rounded one. Computed values (segments, Package) should keep using fmt(),
+// since rounding there correctly absorbs floating-point subtraction noise.
+const fmtTrunc = (v, d = 3) => {
+  if (v === "" || v === null || v === undefined || isNaN(v)) return "—";
+  const num = Number(v);
+  const sign = num < 0 ? "-" : "";
+  const fixed = Math.abs(num).toFixed(d + 4);
+  const dot = fixed.indexOf(".");
+  return sign + (d === 0 ? fixed.slice(0, dot) : fixed.slice(0, dot + 1 + d));
 };
 
 const fmtDate = (iso) => {
@@ -437,21 +456,29 @@ export default function NovaRunTracker() {
     setSheetOpen(true);
   };
 
+  const [saving, setSaving] = useState(false);
+
   const saveRun = async () => {
+    if (saving) return;
     if (!form.track.trim()) return;
     if (form.type === "box" && `${form.delay}`.trim() === "") return;
-    const isNew = !form.id;
-    const runToSave = { ...form, id: form.id || genId(), createdAt: form.createdAt || Date.now() };
-    let next;
-    if (isNew) {
-      next = [runToSave, ...runs];
-      const bumpedComponents = components.map((c) => ({ ...c, sinceRuns: c.sinceRuns + 1 }));
-      await persistComponents(bumpedComponents);
-    } else {
-      next = runs.map((r) => (r.id === runToSave.id ? runToSave : r));
+    setSaving(true);
+    try {
+      const isNew = !form.id;
+      const runToSave = { ...form, id: form.id || genId(), createdAt: form.createdAt || Date.now() };
+      let next;
+      if (isNew) {
+        next = [runToSave, ...runs];
+        const bumpedComponents = components.map((c) => ({ ...c, sinceRuns: c.sinceRuns + 1 }));
+        await persistComponents(bumpedComponents);
+      } else {
+        next = runs.map((r) => (r.id === runToSave.id ? runToSave : r));
+      }
+      await persistRuns(next);
+      setSheetOpen(false);
+    } finally {
+      setSaving(false);
     }
-    await persistRuns(next);
-    setSheetOpen(false);
   };
 
   const deleteRun = async (id) => {
@@ -965,6 +992,7 @@ export default function NovaRunTracker() {
           form={form}
           setForm={setForm}
           onSave={saveRun}
+          saving={saving}
           onClose={() => setSheetOpen(false)}
           bigText={bigText}
           setBigText={setBigText}
@@ -1035,13 +1063,13 @@ function RunCard({ run, expanded, onToggle, onEdit, onDelete, showTypeBadge, sin
         </div>
 
         <div className="hide-scrollbar overflow-x-auto flex gap-1.5 px-3 pt-1.5 pb-2">
-          <CompactStat label="Dial" value={hasDial ? fmt(run.dialIn, 2) : "—"} />
-          <CompactStat label="RT" value={fmt(run.rt)} />
-          <CompactStat label="60'" value={fmt(run.sixty)} />
-          <CompactStat label="330'" value={fmt(run.threeThirty)} />
+          <CompactStat label="Dial" value={hasDial ? fmtTrunc(run.dialIn, 2) : "—"} />
+          <CompactStat label="RT" value={fmtTrunc(run.rt)} />
+          <CompactStat label="60'" value={fmtTrunc(run.sixty)} />
+          <CompactStat label="330'" value={fmtTrunc(run.threeThirty)} />
           <CompactStat label="60-330" value={fmt(seg60_330)} tone="amber" />
-          <CompactStat label="1/8 ET" value={fmt(run.eighth)} tone="bright" />
-          <CompactStat label="MPH" value={fmt(run.mph, 2)} />
+          <CompactStat label="1/8 ET" value={fmtTrunc(run.eighth)} tone="bright" />
+          <CompactStat label="MPH" value={fmtTrunc(run.mph, 2)} />
           <CompactStat label="330-1/8" value={fmt(seg330_8th)} tone="amber" />
           <CompactStat label="Package" value={pkgInfo.text} tone={pkgInfo.tone} />
         </div>
@@ -1056,7 +1084,7 @@ function RunCard({ run, expanded, onToggle, onEdit, onDelete, showTypeBadge, sin
 
           {run.type === "box" && (
             <div className="grid grid-cols-2 gap-2 mb-3">
-              <Stat label="Delay" value={fmt(run.delay)} />
+              <Stat label="Delay" value={fmtTrunc(run.delay)} />
               <div />
             </div>
           )}
@@ -1361,7 +1389,7 @@ function TrackLocationPrompt({ trackName, onGeocode, onResolved, onSkip }) {
 
 const SCAN_FIELDS = ["dialIn", "rt", "sixty", "threeThirty", "eighth", "mph"];
 
-function RunSheet({ form, setForm, onSave, onClose, bigText, setBigText, tracks, onAddTrack, onGeocode, onSetLocation }) {
+function RunSheet({ form, setForm, onSave, saving, onClose, bigText, setBigText, tracks, onAddTrack, onGeocode, onSetLocation }) {
   const set = (key) => (val) => setForm({ ...form, [key]: val });
 
   const [scanning, setScanning] = useState(false);
@@ -1580,7 +1608,31 @@ function RunSheet({ form, setForm, onSave, onClose, bigText, setBigText, tracks,
         </div>
 
         <div className="grid grid-cols-3 gap-3 mb-3">
-          <Field label="RT" type="number" value={form.rt} onChange={set("rt")} placeholder="0.000" />
+          <div>
+            <div className="text-[10px] uppercase tracking-wide text-zinc-500 mb-1">RT</div>
+            <div className="flex gap-1">
+              <button
+                type="button"
+                onClick={() => {
+                  const cur = String(form.rt ?? "");
+                  const next = cur.startsWith("-") ? cur.slice(1) : cur === "" ? "-" : `-${cur}`;
+                  setForm({ ...form, rt: next });
+                }}
+                title="Toggle red light (negative RT)"
+                className="shrink-0 w-9 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-300 text-base font-semibold active:bg-zinc-800"
+              >
+                ±
+              </button>
+              <input
+                type="text"
+                inputMode="decimal"
+                value={form.rt}
+                placeholder="0.000"
+                onChange={(e) => set("rt")(e.target.value)}
+                className="w-full min-w-0 bg-zinc-950 border border-zinc-800 rounded-lg px-2 py-2 text-sm font-num text-zinc-100 focus:outline-none focus:border-amber-500"
+              />
+            </div>
+          </div>
           <Field label="60'" type="number" value={form.sixty} onChange={set("sixty")} placeholder="0.000" />
           <Field label="330'" type="number" value={form.threeThirty} onChange={set("threeThirty")} placeholder="0.000" />
         </div>
@@ -1692,10 +1744,11 @@ function RunSheet({ form, setForm, onSave, onClose, bigText, setBigText, tracks,
 
         <button
           onClick={onSave}
-          disabled={!form.track.trim() || (form.type === "box" && `${form.delay}`.trim() === "")}
-          className="w-full py-3 rounded-xl bg-amber-400 text-zinc-950 font-display uppercase tracking-wide text-sm font-semibold disabled:opacity-40"
+          disabled={saving || !form.track.trim() || (form.type === "box" && `${form.delay}`.trim() === "")}
+          className="w-full py-3 rounded-xl bg-amber-400 text-zinc-950 font-display uppercase tracking-wide text-sm font-semibold disabled:opacity-40 flex items-center justify-center gap-2"
         >
-          {form.id ? "Save Changes" : "Save Run"}
+          {saving && <RefreshCw size={16} className="animate-spin" />}
+          {saving ? "Saving…" : form.id ? "Save Changes" : "Save Run"}
         </button>
         {form.type === "box" && `${form.delay}`.trim() === "" && (
           <div className="text-[11px] text-zinc-600 text-center mt-2">Delay is required for Box runs.</div>
