@@ -1,40 +1,60 @@
-import { supabase } from "./supabaseClient";
-
-// Mimics the original artifact window.storage API so the rest of the app
-// doesn't need to change: get(key) -> { key, value } | null, set(key, value).
-// Everything is stored in a single "kv_store" table: key text primary key, value jsonb.
+// Talks to our own /api/storage route (server-side, using a secret Supabase
+// service role key) instead of hitting Supabase directly from the browser —
+// the browser never sees a Supabase key at all. Mimics the original artifact
+// window.storage API so the rest of the app doesn't need to change:
+// get(key) -> { key, value } | null, set(key, value).
 
 export const storage = {
   async get(key) {
-    const { data, error } = await supabase.from("kv_store").select("value").eq("key", key).maybeSingle();
-    if (error) {
-      console.error("storage.get error:", error);
+    try {
+      const res = await fetch(`/api/storage?key=${encodeURIComponent(key)}`);
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data || data.value == null) return null;
+      return { key, value: JSON.stringify(data.value) };
+    } catch (e) {
+      console.error("storage.get error:", e);
       return null;
     }
-    if (!data) return null;
-    return { key, value: JSON.stringify(data.value) };
   },
 
   async set(key, value) {
     const parsed = typeof value === "string" ? JSON.parse(value) : value;
-    const { error } = await supabase.from("kv_store").upsert({ key, value: parsed, updated_at: new Date().toISOString() });
-    if (error) {
-      console.error("storage.set error:", error);
+    try {
+      const res = await fetch("/api/storage", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ key, value: parsed }),
+      });
+      if (!res.ok) {
+        console.error("storage.set error:", await res.text().catch(() => ""));
+        return null;
+      }
+      return { key, value };
+    } catch (e) {
+      console.error("storage.set error:", e);
       return null;
     }
-    return { key, value };
   },
 
-  // Calls onChange(key) whenever ANY device writes to kv_store, so the UI can
-  // re-fetch and stay in sync without a manual restart. Returns an unsubscribe fn.
+  // No more realtime websocket — that required exposing a Supabase key to
+  // the browser, which is exactly what we removed. Polls instead: checks in
+  // periodically, and immediately when the tab regains focus, so another
+  // device's changes still show up without a manual restart.
   subscribe(onChange) {
-    const channel = supabase
-      .channel("kv_store_changes")
-      .on("postgres_changes", { event: "*", schema: "public", table: "kv_store" }, (payload) => {
-        const key = payload.new?.key || payload.old?.key;
-        onChange(key);
-      })
-      .subscribe();
-    return () => supabase.removeChannel(channel);
+    let stopped = false;
+    const tick = () => {
+      if (stopped || document.hidden) return;
+      onChange();
+    };
+    const interval = setInterval(tick, 20000);
+    const onVisible = () => {
+      if (!document.hidden) tick();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      stopped = true;
+      clearInterval(interval);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
   },
 };

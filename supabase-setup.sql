@@ -6,13 +6,11 @@ create table if not exists kv_store (
   updated_at timestamptz default now()
 );
 
--- Enables live sync: when one device saves a run, other open devices
--- automatically pull the update within a second or two (no restart needed).
--- If you already ran the table creation above on a previous visit, you can
--- just run this ALTER line by itself — re-running create table is harmless too.
-alter publication supabase_realtime add table kv_store;
-
--- This app is single-user with no login, so Row Level Security stays off
--- (the default for a new table) and the anon/publishable key can read/write freely.
--- That's fine for personal race data, but do not put anything sensitive
--- (passwords, financial info, etc.) into this table.
+-- Row Level Security is ON with no policies, which denies ALL access via
+-- the public anon key by default — the app never uses that key anyway. All
+-- reads/writes go through api/storage.js on the server, using the SERVICE
+-- ROLE key (Project Settings → API → service_role), which bypasses RLS.
+-- If you already created this table before with RLS off, just run this
+-- ALTER line by itself to lock it down — re-running the create table above
+-- is harmless too.
+alter table kv_store enable row level security;
