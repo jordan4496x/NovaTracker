@@ -233,6 +233,9 @@ export default function NovaRunTracker() {
   const [pendingImport, setPendingImport] = useState(null);
   const [importError, setImportError] = useState("");
   const fileInputRef = useRef(null);
+  // Counts saves currently in flight (runs/components/tracks). While > 0,
+  // the background poll skips itself — see loadData().
+  const pendingWrites = useRef(0);
 
   const downloadBlob = (content, mime, filename) => {
     const blob = new Blob([content], { type: mime });
@@ -325,6 +328,10 @@ export default function NovaRunTracker() {
   const [syncing, setSyncing] = useState(false);
 
   const loadData = async ({ silent } = {}) => {
+    // A save is still in flight (e.g. slow connection at the track) — the
+    // screen already reflects it optimistically, so skip this fetch rather
+    // than race the save and clobber the screen with stale server data.
+    if (pendingWrites.current > 0) return;
     if (!silent) setSyncing(true);
     let loadedRuns = [];
     let loadedComponents = null;
@@ -384,23 +391,35 @@ export default function NovaRunTracker() {
 
   const persistRuns = async (next) => {
     setRuns(next);
+    pendingWrites.current++;
     try {
       await storage.set(RUNS_KEY, JSON.stringify(next));
-    } catch (e) {}
+    } catch (e) {
+    } finally {
+      pendingWrites.current--;
+    }
   };
 
   const persistComponents = async (next) => {
     setComponents(next);
+    pendingWrites.current++;
     try {
       await storage.set(COMPONENTS_KEY, JSON.stringify(next));
-    } catch (e) {}
+    } catch (e) {
+    } finally {
+      pendingWrites.current--;
+    }
   };
 
   const persistTracks = async (next) => {
     setTracks(next);
+    pendingWrites.current++;
     try {
       await storage.set(TRACKS_KEY, JSON.stringify(next));
-    } catch (e) {}
+    } catch (e) {
+    } finally {
+      pendingWrites.current--;
+    }
   };
 
   const addTrack = async (name, lat = null, lon = null) => {
@@ -1502,7 +1521,12 @@ function RunSheet({ form, setForm, onSave, saving, onClose, bigText, setBigText,
               <Eye size={13} />
               No Glasses
             </button>
-            <button onClick={onClose} className="text-zinc-500">
+            <button
+              onClick={onClose}
+              disabled={saving}
+              className="text-zinc-500 disabled:opacity-30"
+              title={saving ? "Saving — please wait" : undefined}
+            >
               <X size={20} />
             </button>
           </div>
