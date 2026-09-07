@@ -20,6 +20,7 @@ const typeBadgeClass = (type) => TYPE_BADGE_CLASSES[type] || TYPE_BADGE_CLASSES.
 const RUNS_KEY = "novalog-runs";
 const COMPONENTS_KEY = "novalog-components";
 const TRACKS_KEY = "novalog-tracks";
+const BASELINE_KEY = "novalog-baseline";
 
 // Tracks carry an optional lat/lon (resolved via /api/geocode, on demand)
 // so weather lookups know where to query. null until resolved.
@@ -220,11 +221,21 @@ export default function NovaRunTracker() {
   const [runs, setRuns] = useState([]);
   const [components, setComponents] = useState([]);
   const [tracks, setTracks] = useState(DEFAULT_TRACKS);
+  // Date of the most recent "rebaseline" (e.g. an engine rebuild) — when
+  // set, Run Predictor / the DA table / lift estimates only draw on runs
+  // from this date forward, since older runs may no longer reflect how the
+  // car performs. Old runs and their own historical displays are untouched.
+  const [predictiveBaseline, setPredictiveBaseline] = useState(null);
   const [tab, setTab] = useState("nobox"); // nobox | box | all | setup
+  // Date-range filter for the No Box/Box/Elliot tabs. Plain component state
+  // on purpose — never persisted, so every fresh load starts back at "All".
+  const [rangeFrom, setRangeFrom] = useState("");
+  const [rangeTo, setRangeTo] = useState("");
   const [sheetOpen, setSheetOpen] = useState(false);
   const [form, setForm] = useState(emptyForm("nobox"));
   const [expandedId, setExpandedId] = useState(null);
   const [confirmDeleteId, setConfirmDeleteId] = useState(null);
+  const [confirmServiceId, setConfirmServiceId] = useState(null);
   const [newCompName, setNewCompName] = useState("");
   const [historyFor, setHistoryFor] = useState(null);
   const [editingCountId, setEditingCountId] = useState(null);
@@ -365,9 +376,16 @@ export default function NovaRunTracker() {
     const newFromRuns = runTrackNames.filter((n) => !knownNames.has(n)).map((name) => ({ name, lat: null, lon: null }));
     const mergedTracks = [...loadedTracks, ...newFromRuns].sort((a, b) => a.name.localeCompare(b.name));
 
+    let loadedBaseline = null;
+    try {
+      const b = await storage.get(BASELINE_KEY);
+      if (b && b.value) loadedBaseline = JSON.parse(b.value);
+    } catch (e) {}
+
     setRuns(loadedRuns);
     setComponents(loadedComponents);
     setTracks(mergedTracks);
+    setPredictiveBaseline(loadedBaseline);
     setLoaded(true);
     setSyncing(false);
 
@@ -416,6 +434,17 @@ export default function NovaRunTracker() {
     pendingWrites.current++;
     try {
       await storage.set(TRACKS_KEY, JSON.stringify(next));
+    } catch (e) {
+    } finally {
+      pendingWrites.current--;
+    }
+  };
+
+  const persistPredictiveBaseline = async (next) => {
+    setPredictiveBaseline(next);
+    pendingWrites.current++;
+    try {
+      await storage.set(BASELINE_KEY, JSON.stringify(next));
     } catch (e) {
     } finally {
       pendingWrites.current--;
@@ -506,7 +535,7 @@ export default function NovaRunTracker() {
     setConfirmDeleteId(null);
   };
 
-  const markServiced = async (id) => {
+  const markServiced = async (id, rebaseline) => {
     const next = components.map((c) =>
       c.id === id
         ? {
@@ -517,6 +546,10 @@ export default function NovaRunTracker() {
         : c
     );
     await persistComponents(next);
+    if (rebaseline) {
+      await persistPredictiveBaseline(todayStr());
+    }
+    setConfirmServiceId(null);
   };
 
   const addComponent = async () => {
@@ -545,13 +578,16 @@ export default function NovaRunTracker() {
     if (tab === "nobox") list = runs.filter((r) => r.type === "nobox");
     if (tab === "box") list = runs.filter((r) => r.type === "box");
     if (tab === "elliot") list = runs.filter((r) => r.type === "elliot");
+    if ((tab === "nobox" || tab === "box" || tab === "elliot") && (rangeFrom || rangeTo)) {
+      list = list.filter((r) => (!rangeFrom || r.date >= rangeFrom) && (!rangeTo || r.date <= rangeTo));
+    }
     return [...list].sort((a, b) => {
       const av = `${a.date}T${a.time || "00:00"}`;
       const bv = `${b.date}T${b.time || "00:00"}`;
       if (av !== bv) return av < bv ? 1 : -1;
       return (b.createdAt || 0) - (a.createdAt || 0);
     });
-  }, [runs, tab]);
+  }, [runs, tab, rangeFrom, rangeTo]);
 
   // Gap to the previous run across ALL types (the car's actual last time at
   // the track), keyed by run id, regardless of which tab is being viewed.
@@ -571,6 +607,10 @@ export default function NovaRunTracker() {
   // For each lifted run, how much slower its 330-1/8 segment was than the
   // last full (non-lifted) run of the same type before it — the projected
   // time the lift cost. Non-lifted runs get no value (they just show "Full").
+  // If a rebaseline is set, the "last full run" tracking is wiped clean the
+  // moment we cross that date, so a run after a rebuild never gets compared
+  // against pre-rebuild segments — runs before it keep their original,
+  // still-accurate estimates.
   const liftProjection = useMemo(() => {
     const sorted = [...runs].sort((a, b) => {
       const ta = runTimestamp(a);
@@ -578,8 +618,13 @@ export default function NovaRunTracker() {
       return ta !== tb ? ta - tb : (a.createdAt || 0) - (b.createdAt || 0);
     });
     const map = {};
-    const lastFullSegByType = {};
+    let lastFullSegByType = {};
+    let crossedBaseline = false;
     for (const r of sorted) {
+      if (!crossedBaseline && predictiveBaseline && r.date >= predictiveBaseline) {
+        lastFullSegByType = {};
+        crossedBaseline = true;
+      }
       const { seg330_8th } = computeSegments(r);
       if (r.lifted) {
         const lastFull = lastFullSegByType[r.type];
@@ -589,7 +634,7 @@ export default function NovaRunTracker() {
       }
     }
     return map;
-  }, [runs]);
+  }, [runs, predictiveBaseline]);
 
   const stats = useMemo(() => {
     if (visibleRuns.length === 0) return null;
@@ -639,7 +684,9 @@ export default function NovaRunTracker() {
   // calendar date (ignoring year), ties broken by time of day.
   const runPrediction = useMemo(() => {
     if (!predictTrack) return null;
-    const atTrack = runs.filter((r) => r.track === predictTrack);
+    const atTrack = runs.filter(
+      (r) => r.track === predictTrack && (!predictiveBaseline || r.date >= predictiveBaseline)
+    );
     const fullCandidates = atTrack.filter((r) => !r.lifted && computeSegments(r).seg330_8th != null);
     const threeThirtyCandidates = atTrack.filter((r) => !isNaN(parseFloat(r.threeThirty)));
 
@@ -654,7 +701,7 @@ export default function NovaRunTracker() {
     const threeThirty = parseFloat(threeThirtyRun.threeThirty);
 
     return { value: threeThirty + seg330_8th, threeThirty, threeThirtyRun, seg330_8th, seg330_8thRun };
-  }, [runs, predictTrack, predictDate, predictTime]);
+  }, [runs, predictTrack, predictDate, predictTime, predictiveBaseline]);
 
   const [daTableTrack, setDaTableTrack] = useState("");
 
@@ -663,10 +710,13 @@ export default function NovaRunTracker() {
   // averages every run at that DA (lifted or not — a lift always happens
   // after 330', so that phase is never affected). 1/8 ET uses true full
   // (non-lifted) runs only, no estimated/predicted numbers. Optionally
-  // filtered to one track.
+  // filtered to one track, and always filtered to on/after a rebaseline
+  // date if one is set.
   const daTable = useMemo(() => {
     const DA_STEP = 200;
-    const trackRuns = runs.filter((r) => !daTableTrack || r.track === daTableTrack);
+    const trackRuns = runs.filter(
+      (r) => (!daTableTrack || r.track === daTableTrack) && (!predictiveBaseline || r.date >= predictiveBaseline)
+    );
     const withDa = trackRuns
       .map((r) => ({ r, da: parseFloat(r.da) }))
       .filter((x) => !isNaN(x.da));
@@ -705,7 +755,7 @@ export default function NovaRunTracker() {
     }
 
     return rows;
-  }, [runs, daTableTrack]);
+  }, [runs, daTableTrack, predictiveBaseline]);
 
   const serviceLog = useMemo(() => {
     return runs
@@ -814,6 +864,35 @@ export default function NovaRunTracker() {
                 ))}
               </div>
             )}
+
+            <div className="text-[10px] uppercase tracking-wide text-zinc-500 mb-1.5 mt-3">Filter by Date</div>
+            <div className="flex items-center gap-2">
+              <input
+                type="date"
+                value={rangeFrom}
+                onChange={(e) => setRangeFrom(e.target.value)}
+                className="flex-1 min-w-0 bg-zinc-950 border border-zinc-800 rounded-lg px-2 py-1.5 text-xs font-num text-zinc-100 focus:outline-none focus:border-amber-500"
+              />
+              <span className="text-zinc-600 text-[10px] uppercase shrink-0">to</span>
+              <input
+                type="date"
+                value={rangeTo}
+                onChange={(e) => setRangeTo(e.target.value)}
+                className="flex-1 min-w-0 bg-zinc-950 border border-zinc-800 rounded-lg px-2 py-1.5 text-xs font-num text-zinc-100 focus:outline-none focus:border-amber-500"
+              />
+              {(rangeFrom || rangeTo) && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setRangeFrom("");
+                    setRangeTo("");
+                  }}
+                  className="shrink-0 text-[10px] uppercase tracking-wide text-zinc-400 px-2.5 py-1.5 rounded-lg border border-zinc-800 bg-zinc-900"
+                >
+                  All
+                </button>
+              )}
+            </div>
           </div>
         ) : (
           <div className="text-[11px] text-zinc-500">
@@ -849,7 +928,7 @@ export default function NovaRunTracker() {
             setNewCompName={setNewCompName}
             addComponent={addComponent}
             removeComponent={removeComponent}
-            markServiced={markServiced}
+            onMarkServiceClick={setConfirmServiceId}
             historyFor={historyFor}
             setHistoryFor={setHistoryFor}
             editingCountId={editingCountId}
@@ -886,6 +965,7 @@ export default function NovaRunTracker() {
             daTable={daTable}
             daTableTrack={daTableTrack}
             setDaTableTrack={setDaTableTrack}
+            predictiveBaseline={predictiveBaseline}
           />
         ) : visibleRuns.length === 0 ? (
           <div className="text-center py-16 text-zinc-500">
@@ -931,6 +1011,45 @@ export default function NovaRunTracker() {
                 className="flex-1 py-2 rounded-lg bg-red-600 text-white text-sm font-medium"
               >
                 Delete
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Mark serviced / rebaseline confirm */}
+      {confirmServiceId && (
+        <div className="fixed inset-0 z-40 bg-black/70 flex items-center justify-center px-6">
+          <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-5 w-full max-w-xs">
+            <div className="flex items-center gap-2 text-emerald-400 mb-2">
+              <Wrench size={18} />
+              <div className="font-display uppercase text-sm tracking-wide">
+                Mark {components.find((c) => c.id === confirmServiceId)?.name || "item"} serviced?
+              </div>
+            </div>
+            <div className="text-xs text-zinc-400 mb-4">
+              Rebaseline the predictive calculations (Run Predictor, DA table, lift estimates) from today forward?
+              Do this for a change big enough to affect how the car performs, like an engine rebuild — a routine
+              service usually isn't. Every existing run stays in your history either way.
+            </div>
+            <div className="flex flex-col gap-2">
+              <button
+                onClick={() => markServiced(confirmServiceId, true)}
+                className="w-full py-2 rounded-lg bg-amber-400 text-zinc-950 text-sm font-medium"
+              >
+                Yes, Rebaseline
+              </button>
+              <button
+                onClick={() => markServiced(confirmServiceId, false)}
+                className="w-full py-2 rounded-lg bg-zinc-800 text-zinc-200 text-sm font-medium"
+              >
+                No, Just Log Service
+              </button>
+              <button
+                onClick={() => setConfirmServiceId(null)}
+                className="w-full py-2 rounded-lg text-zinc-500 text-sm"
+              >
+                Cancel
               </button>
             </div>
           </div>
@@ -1804,9 +1923,20 @@ function PredictionPanel({
   daTable,
   daTableTrack,
   setDaTableTrack,
+  predictiveBaseline,
 }) {
   return (
     <div>
+      {predictiveBaseline && (
+        <div className="flex items-center gap-1.5 text-[11px] text-amber-400 bg-amber-950/50 border border-amber-900 rounded-lg px-3 py-2 mb-4">
+          <RefreshCw size={12} />
+          <span>
+            Rebaselined {fmtDate(predictiveBaseline)} — Run Predictor and the DA table below only use runs from that
+            date forward.
+          </span>
+        </div>
+      )}
+
       <div className="text-[11px] uppercase tracking-wide text-zinc-500 mb-2 font-display">Run Completion</div>
 
       {availableDates.length === 0 ? (
@@ -2010,7 +2140,7 @@ function SetupPanel({
   setNewCompName,
   addComponent,
   removeComponent,
-  markServiced,
+  onMarkServiceClick,
   historyFor,
   setHistoryFor,
   editingCountId,
@@ -2101,7 +2231,7 @@ function SetupPanel({
                   History
                 </button>
                 <button
-                  onClick={() => markServiced(c.id)}
+                  onClick={() => onMarkServiceClick(c.id)}
                   className="text-xs text-zinc-950 bg-emerald-400 rounded-lg px-3 py-2 font-medium"
                 >
                   Mark Serviced
