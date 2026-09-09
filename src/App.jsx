@@ -5,8 +5,79 @@ import {
   Thermometer, Droplets, Wind, Mountain, Calendar, MapPin,
   Flame, Settings2, Package, Layers, Zap, Wrench, TriangleAlert,
   Hand, Flag, Calculator, Eye, Download, Upload, RefreshCw, User,
-  Camera, Image as ImageIcon, CloudSun
+  Camera, Image as ImageIcon, CloudSun, Sun, Moon
 } from "lucide-react";
+
+// Every screen is built from hardcoded dark Tailwind color classes (this
+// predates the theme toggle). Rather than touch every className in the
+// file, light mode is a CSS override layer: same classes, remapped colors,
+// scoped under [data-theme="light"] on the root element.
+const THEME_CSS = `
+  @import url('https://fonts.googleapis.com/css2?family=Oswald:wght@500;600;700&family=JetBrains+Mono:wght@500;600;700&display=swap');
+  html, body { touch-action: pan-x pan-y; overscroll-behavior: none; }
+  .font-display { font-family: 'Oswald', sans-serif; letter-spacing: 0.02em; }
+  .font-num { font-family: 'JetBrains Mono', monospace; font-variant-numeric: tabular-nums; }
+  .hide-scrollbar::-webkit-scrollbar { display: none; }
+  .hide-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+
+  [data-theme="light"] { color-scheme: light; }
+
+  /* Surfaces. The plain-descendant selector (space) doesn't match the root
+     element itself, which carries data-theme AND these classes together
+     (it's the full-page backdrop) — so each also gets a no-space compound
+     selector to cover that case. */
+  [data-theme="light"] .bg-zinc-950, [data-theme="light"].bg-zinc-950 { background-color: #f4f4f5; }
+  [data-theme="light"] .bg-zinc-950\\/95, [data-theme="light"].bg-zinc-950\\/95 { background-color: rgb(244 244 245 / 0.95); }
+  [data-theme="light"] .bg-zinc-900, [data-theme="light"].bg-zinc-900 { background-color: #ffffff; }
+  [data-theme="light"] .bg-zinc-800, [data-theme="light"].bg-zinc-800 { background-color: #e4e4e7; }
+
+  /* Borders */
+  [data-theme="light"] .border-zinc-800 { border-color: #e4e4e7; }
+  [data-theme="light"] .divide-zinc-800 > :not([hidden]) ~ :not([hidden]) { border-color: #e4e4e7; }
+  [data-theme="light"] .border-zinc-700 { border-color: #d4d4d8; }
+  [data-theme="light"] .border-zinc-600 { border-color: #a1a1aa; }
+
+  /* Text */
+  [data-theme="light"] .text-zinc-50 { color: #18181b; }
+  [data-theme="light"] .text-zinc-100, [data-theme="light"].text-zinc-100 { color: #27272a; }
+  [data-theme="light"] .text-zinc-200 { color: #3f3f46; }
+  [data-theme="light"] .text-zinc-300 { color: #52525b; }
+  [data-theme="light"] .text-zinc-400 { color: #52525b; }
+  [data-theme="light"] .text-zinc-500 { color: #71717a; }
+  [data-theme="light"] .text-zinc-600 { color: #71717a; }
+  [data-theme="light"] .text-zinc-700 { color: #a1a1aa; }
+
+  /* The one "neutral selected" pill (Time Trial) — inverts instead of
+     lightening further, so it still stands out against a light page. */
+  [data-theme="light"] .bg-zinc-100.border-zinc-100.text-zinc-950 {
+    background-color: #18181b; border-color: #18181b; color: #fafafa;
+  }
+
+  /* Amber accent */
+  [data-theme="light"] .text-amber-400 { color: #d97706; }
+  [data-theme="light"] .border-amber-700 { border-color: #fbbf24; }
+  [data-theme="light"] .border-amber-900 { border-color: #fde68a; }
+  [data-theme="light"] .bg-amber-950 { background-color: #fef3c7; }
+  [data-theme="light"] .bg-amber-950\\/50 { background-color: rgb(254 243 199 / 0.6); }
+
+  /* Result/status colors */
+  [data-theme="light"] .text-red-400 { color: #dc2626; }
+  [data-theme="light"] .bg-red-950 { background-color: #fee2e2; }
+  [data-theme="light"] .border-red-700 { border-color: #fca5a5; }
+  [data-theme="light"] .border-red-800 { border-color: #fecaca; }
+  [data-theme="light"] .border-red-900 { border-color: #fecaca; }
+  [data-theme="light"] .text-emerald-400 { color: #059669; }
+  [data-theme="light"] .bg-emerald-950 { background-color: #d1fae5; }
+  [data-theme="light"] .bg-emerald-950\\/50 { background-color: rgb(209 250 229 / 0.6); }
+  [data-theme="light"] .border-emerald-800 { border-color: #6ee7b7; }
+  [data-theme="light"] .border-emerald-900 { border-color: #a7f3d0; }
+
+  /* Type badges (No Box/Box/Elliot chips on the All tab) */
+  [data-theme="light"] .bg-sky-950 { background-color: #e0f2fe; }
+  [data-theme="light"] .text-sky-400 { color: #0284c7; }
+  [data-theme="light"] .bg-violet-950 { background-color: #ede9fe; }
+  [data-theme="light"] .text-violet-400 { color: #7c3aed; }
+`;
 
 const TYPE_LABELS = { nobox: "No Box", box: "Box", elliot: "Elliot" };
 const typeLabel = (type) => TYPE_LABELS[type] || type;
@@ -241,6 +312,22 @@ export default function NovaRunTracker() {
   const [editingCountId, setEditingCountId] = useState(null);
   const [editingCountVal, setEditingCountVal] = useState("");
   const [bigText, setBigText] = useState(false);
+  const [theme, setTheme] = useState(() => {
+    try {
+      return localStorage.getItem("novalog-theme") || "dark";
+    } catch {
+      return "dark";
+    }
+  });
+  const toggleTheme = () => {
+    setTheme((t) => {
+      const next = t === "dark" ? "light" : "dark";
+      try {
+        localStorage.setItem("novalog-theme", next);
+      } catch {}
+      return next;
+    });
+  };
   const [pendingImport, setPendingImport] = useState(null);
   const [importError, setImportError] = useState("");
   const fileInputRef = useRef(null);
@@ -790,7 +877,8 @@ export default function NovaRunTracker() {
 
   if (!loaded) {
     return (
-      <div className="min-h-screen bg-zinc-950 flex items-center justify-center">
+      <div data-theme={theme} className="min-h-screen bg-zinc-950 flex items-center justify-center">
+        <style>{THEME_CSS}</style>
         <div className="text-amber-400 font-mono text-sm tracking-widest animate-pulse">LOADING LOG…</div>
       </div>
     );
@@ -798,17 +886,11 @@ export default function NovaRunTracker() {
 
   return (
     <div
+      data-theme={theme}
       className="min-h-screen bg-zinc-950 text-zinc-100 pb-28"
       style={{ fontFamily: "'Inter', system-ui, sans-serif", zoom: bigText ? 1.5 : 1 }}
     >
-      <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=Oswald:wght@500;600;700&family=JetBrains+Mono:wght@500;600;700&display=swap');
-        html, body { touch-action: pan-x pan-y; overscroll-behavior: none; }
-        .font-display { font-family: 'Oswald', sans-serif; letter-spacing: 0.02em; }
-        .font-num { font-family: 'JetBrains Mono', monospace; font-variant-numeric: tabular-nums; }
-        .hide-scrollbar::-webkit-scrollbar { display: none; }
-        .hide-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
-      `}</style>
+      <style>{THEME_CSS}</style>
 
       {/* Header */}
       <div className="sticky top-0 z-20 bg-zinc-950/95 backdrop-blur border-b border-zinc-800 px-4 pt-5 pb-3">
@@ -826,6 +908,13 @@ export default function NovaRunTracker() {
               title="Refresh from database"
             >
               <RefreshCw size={13} className={syncing ? "animate-spin" : ""} />
+            </button>
+            <button
+              onClick={toggleTheme}
+              className="flex items-center justify-center w-8 h-8 rounded-full bg-zinc-900 border border-zinc-800 text-zinc-400"
+              title={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
+            >
+              {theme === "dark" ? <Sun size={13} /> : <Moon size={13} />}
             </button>
             <button
               onClick={() => setBigText(!bigText)}
